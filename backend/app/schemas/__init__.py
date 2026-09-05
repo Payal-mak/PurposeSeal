@@ -1,5 +1,5 @@
 from .copy import CopyCreate
-from .data_asset import DataAssetOut
+from .data_asset import DataAssetCreate, DataAssetOut
 from .dev import ClockAdvanceRequest, ClockStateOut
 from .grant import GrantCreate, GrantOut, GrantStatusOut
 from .lineage import LineageEdge, LineageOut
@@ -11,6 +11,7 @@ __all__ = [
     "GrantCreate",
     "GrantOut",
     "GrantStatusOut",
+    "DataAssetCreate",
     "DataAssetOut",
     "RetrievalCreate",
     "CopyCreate",

@@ -1,11 +1,15 @@
+from typing import Optional
+
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from ..core.clock import clock
 from ..core.errors import NotFoundError
-from ..models.data_asset import DataAsset
+from ..models.data_asset import AssetState, DataAsset
 from ..models.grant import Grant
-from ..schemas.data_asset import DataAssetOut
+from ..schemas.data_asset import DataAssetCreate, DataAssetOut
 from ..schemas.lineage import LineageEdge, LineageOut
+from .audit_service import write_audit_log
 
 
 def get_asset(db: Session, asset_id: int) -> DataAsset:
@@ -13,6 +17,63 @@ def get_asset(db: Session, asset_id: int) -> DataAsset:
     if asset is None:
         raise NotFoundError(f"DataAsset {asset_id} not found", error_code="asset_not_found")
     return asset
+
+
+def create_asset(db: Session, payload: DataAssetCreate) -> DataAsset:
+    """Create an original/root DataAsset — source data that exists
+    independently of any purpose grant. Lifecycle/provenance fields are
+    entirely server-controlled (see DataAssetCreate): parent_asset_id,
+    root_asset_id, and origin_grant_id are always None, and state always
+    starts ACTIVE. This is the only way to create a *root* asset; a
+    "retrieved" or "derived" asset can only come from the retrieval/copy
+    services, which is why this schema doesn't even accept those fields.
+    """
+    asset = DataAsset(
+        name=payload.name,
+        asset_type=payload.asset_type,
+        parent_asset_id=None,
+        root_asset_id=None,
+        origin_grant_id=None,
+        state=AssetState.ACTIVE,
+        fingerprint=None,
+        created_at=clock.now(),
+    )
+    db.add(asset)
+
+    try:
+        db.flush()  # assign asset.id for the audit entry, without committing
+
+        write_audit_log(
+            db,
+            event_type="SOURCE_ASSET_CREATED",
+            entity_type="data_asset",
+            entity_id=asset.id,
+            details={"name": asset.name, "asset_type": asset.asset_type},
+        )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(asset)
+    return asset
+
+
+def list_assets(
+    db: Session,
+    state: Optional[AssetState] = None,
+    asset_type: Optional[str] = None,
+    root_only: bool = False,
+) -> list[DataAsset]:
+    query = db.query(DataAsset)
+    if state is not None:
+        query = query.filter(DataAsset.state == state)
+    if asset_type is not None:
+        query = query.filter(DataAsset.asset_type == asset_type)
+    if root_only:
+        query = query.filter(DataAsset.parent_asset_id.is_(None))
+    return query.order_by(DataAsset.id).all()
 
 
 def to_data_asset_out(db: Session, asset: DataAsset) -> DataAssetOut:

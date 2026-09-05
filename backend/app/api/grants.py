@@ -26,6 +26,12 @@ def get_grant(grant_id: int, db: Session = Depends(get_db)):
     return grant_service.to_grant_out(grant)
 
 
+@router.post("/{grant_id}/revoke", response_model=GrantOut)
+def revoke_grant(grant_id: int, db: Session = Depends(get_db)):
+    grant = grant_service.revoke_grant(db, grant_id)
+    return grant_service.to_grant_out(grant)
+
+
 @router.get("/{grant_id}/status", response_model=GrantStatusOut)
 def get_grant_status(grant_id: int, db: Session = Depends(get_db)):
     grant = grant_service.get_grant(db, grant_id)

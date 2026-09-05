@@ -1019,41 +1019,171 @@ revoking future access to the source.
   live `uvicorn` process — see the worked example above.
 - **Known limitations**: no way to un-quarantine an asset (no
   "restore"/appeal flow — matches the project's scope, which asks for
-  detection and corrective action, not remediation). No revoke-grant
+  detection and corrective action, not remediation). ~~No revoke-grant
   endpoint yet, so `GRANT_REVOKED` is reachable in code but not yet
-  triggerable through any API call. `POST /uses` doesn't itself create
-  any new `DataAsset` — it only evaluates and, on a purpose-lifecycle
-  violation, mutates the existing asset's state; this is intentional
-  (the scenario is "use of already-retrieved data," not another
-  retrieval).
+  triggerable through any API call.~~ **Resolved** by the "Operational
+  APIs" feature below. `POST /uses` doesn't itself create any new
+  `DataAsset` — it only evaluates and, on a purpose-lifecycle violation,
+  mutates the existing asset's state; this is intentional (the scenario
+  is "use of already-retrieved data," not another retrieval).
+
+### Operational APIs — Source Asset Management and Grant Revocation
+
+**Goal**: remove the last requirement to manipulate SQLite directly.
+Before this feature, an original `DataAsset` could only be created by
+seeding it through the ORM (as `conftest.py`'s `existing_asset` fixture
+does); there was also no way to trigger `GRANT_REVOKED`, a reason code
+the policy engine already understood but that no API path produced.
+After this feature, the entire lifecycle — original asset → grant →
+retrieval → copy/derived asset → use evaluation → revocation — is
+reachable purely over HTTP.
+
+- **`POST /assets`** — creates an original/root `DataAsset` from just
+  `name` and `asset_type`. `DataAssetCreate` uses `extra="forbid"`
+  (`backend/app/schemas/data_asset.py`), the same pattern as
+  `CopyCreate`, so a caller cannot supply `parent_asset_id`,
+  `root_asset_id`, `origin_grant_id`, or `state` — those are hard-coded
+  server-side to `None`/`None`/`None`/`ACTIVE`. This is deliberately the
+  *only* way to create a root asset; a "retrieved" or "derived" asset
+  still can only come from `/retrievals` or `/copies`, which is what
+  keeps the purpose-seal model trustworthy (a client can never forge
+  provenance by pretending a fabricated asset was legitimately
+  retrieved).
+  - Audited as `SOURCE_ASSET_CREATED` — a new, distinctly-named event
+    (not `DATA_RETRIEVED`/`COPY_CREATED`), since creating a root asset
+    is a different fact than retrieving or deriving one.
+  - Follows the established flush-then-audit-then-commit atomic pattern
+    (`asset_service.create_asset`).
+- **`GET /assets`** — lists assets with optional `state`, `asset_type`,
+  and `root_only` (`parent_asset_id IS NULL`) query filters, each
+  applied only when provided; no pagination, per the "don't overengineer
+  query syntax" instruction. Reuses the existing `DataAssetOut`
+  serialization (`asset_service.to_data_asset_out`), so list rows carry
+  the same purpose-seal fields (`effective_root_asset_id`,
+  `origin_grant_id`, `origin_purpose`, …) as the single-asset endpoint.
+  `GET /assets/{id}` (already existed) was reused unchanged.
+- **`POST /grants/{id}/revoke`** — marks a grant's stored `status` as
+  `REVOKED` and audits `GRANT_REVOKED`. The grant row is never deleted;
+  its provenance and audit trail must survive, per the task's explicit
+  instruction. Idempotent: revoking an already-revoked grant returns the
+  grant unchanged, `200`, without writing a second `GRANT_REVOKED`
+  event — see the "idempotency decision" below.
+  - Deliberately contains **no** policy logic of its own.
+    `policy_service.evaluate_use` already checked
+    `evaluate_grant_status(grant).status == GrantStatus.REVOKED` and
+    already quarantined on that reason (`GRANT_REVOKED` was already in
+    `PURPOSE_LIFECYCLE_REASONS`) before this feature existed — the
+    revoke endpoint only had to make that stored state reachable via
+    HTTP. Nothing about the policy engine changed.
+- **Idempotency decision** (explicitly requested by the task): repeat
+  revocation is a **safe no-op**, not a conflict response. Rationale —
+  a grant's revocation is a single fact ("this was explicitly revoked"),
+  not a repeatable action; a second identical call carries no new
+  information, and writing a second `GRANT_REVOKED` event would
+  misleadingly suggest two separate lifecycle transitions happened. A
+  `409 Conflict` was the rejected alternative: it would force every
+  caller (including an idempotent retry after a dropped response) to
+  special-case "already revoked" as an error, when nothing has actually
+  gone wrong.
+
+**Worked example (from a live server)**:
+```
+POST /assets {"name": "Patient Lab Result #104", "asset_type": "lab_result"}
+-> 201 {"id": 1, "parent_asset_id": null, "root_asset_id": null,
+        "origin_grant_id": null, "state": "ACTIVE", ...}
+
+POST /grants {...asset_id: 1...}          -> 201 {"id": 1, "status": "ACTIVE", ...}
+POST /retrievals {...grant_id: 1...}      -> 201 {"id": 2, ...}
+POST /copies {...parent_asset_id: 2...}   -> 201 {"id": 3, "state": "ACTIVE", ...}
+
+POST /grants/1/revoke   -> 200 {"id": 1, "status": "REVOKED", ...}
+POST /grants/1/revoke   -> 200 {"id": 1, "status": "REVOKED", ...}  (no 2nd audit event)
+
+POST /uses {"asset_id": 3, "actor": "researcher_01",
+            "purpose": "clinical_trial_screening", "operation": "ANALYZE"}
+-> 200 {"decision": "DENY", "reason_code": "GRANT_REVOKED",
+        "reason": "This grant was explicitly revoked.", ...}
+
+GET /assets/3  -> "state": "QUARANTINED"
+GET /assets/1  -> "state": "ACTIVE"   (root asset untouched)
+```
+
+- **Files added**: `backend/tests/test_source_assets.py`,
+  `backend/tests/test_grant_revocation.py`,
+  `backend/tests/test_full_lifecycle_via_http.py`.
+- **Files modified**: `backend/app/schemas/data_asset.py` (added
+  `DataAssetCreate`), `backend/app/schemas/__init__.py`,
+  `backend/app/services/asset_service.py` (added `create_asset`,
+  `list_assets`), `backend/app/api/assets.py` (added `POST`/`GET ""`),
+  `backend/app/services/grant_service.py` (added `revoke_grant`),
+  `backend/app/api/grants.py` (added `POST /{grant_id}/revoke`).
+- **Endpoints added**: `POST /assets`, `GET /assets`,
+  `POST /grants/{id}/revoke`.
+- **Tests added** (27 new):
+  - `test_source_assets.py` (18 tests): valid creation; no parent; no
+    root pointer; no origin grant; starts `ACTIVE`;
+    `SOURCE_ASSET_CREATED` audit event exists; creation+audit atomic
+    (simulated audit failure leaves nothing committed); missing/empty
+    name rejected; missing asset type rejected; caller cannot inject
+    `parent_asset_id`/`root_asset_id`/`origin_grant_id`/`state`
+    (each `422`, since `DataAssetCreate` uses `extra="forbid"`); list
+    works; list filters by `state`/`asset_type`/`root_only`; retrieve
+    by id; nonexistent asset → clean `404`.
+  - `test_grant_revocation.py` (7 tests): valid grant revoked; persisted
+    status becomes `REVOKED`; `GRANT_REVOKED` audit event exists;
+    revocation+audit atomic; nonexistent grant → `404`; repeated
+    revocation is deterministic and idempotent (single audit event,
+    `200` both times).
+  - `test_full_lifecycle_via_http.py` (1 integration test): create
+    asset → grant → retrieve → derive a copy → revoke the grant →
+    attempt to use the copy → confirm `DENY`/`GRANT_REVOKED` → confirm
+    the copy is quarantined and the root asset is untouched — all
+    through HTTP, proving no ORM seeding is required anywhere in the
+    loop.
+- **Test result**: `102 passed, 2 warnings in 15.32s` — full suite (75
+  prior + 27 new), zero regressions. Also manually verified the full
+  HTTP-only lifecycle end-to-end against a live `uvicorn` process,
+  including idempotent double-revocation — see the worked example
+  above.
+- **Known limitations**: no un-revoke/reinstate endpoint (matches the
+  project's "no remediation" scope, same as quarantine). No way to
+  edit or delete an asset once created. `root_only=true` uses
+  `parent_asset_id IS NULL`, which also happens to match "has no
+  origin grant" for every asset in the current model — the two concepts
+  aren't distinguished because nothing yet needs an asset with a parent
+  but no origin grant.
 
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | GET | /health | Liveness check — `{status, app_name}` |
+| POST | /assets | Create an original/root `DataAsset` (`name`, `asset_type` only — provenance fields are server-controlled) |
+| GET | /assets | List assets; optional `state`, `asset_type`, `root_only` filters |
+| GET | /assets/{id} | Get one asset by id, with its purpose seal resolved |
+| GET | /assets/{id}/lineage | Get the full lineage tree (`{root_asset_id, nodes, edges}`) containing this asset |
 | POST | /grants | Create a purpose-bound access grant for an existing `asset_id` (requires `allowed_operations`, at least one) |
 | GET | /grants | List all grants (with live-evaluated `status`) |
 | GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
 | GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
+| POST | /grants/{id}/revoke | Explicitly revoke a grant (persists `status: REVOKED` + `GRANT_REVOKED` audit event); idempotent — repeat calls return the already-revoked grant without a duplicate event |
 | POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` |
 | POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant |
-| GET | /assets/{id} | Get one asset by id, with its purpose seal resolved |
-| GET | /assets/{id}/lineage | Get the full lineage tree (`{root_asset_id, nodes, edges}`) containing this asset |
 | POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at}` |
 | GET | /dev/clock | **Simulation only** — current simulated time |
 | POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
 
-No endpoint yet creates an *original* `DataAsset` — one must currently be
-seeded directly via the ORM (as the tests do) before a grant can
-reference it or a retrieval can happen against it.
+The entire lifecycle — original asset → grant → retrieval → copy/derived
+asset → use evaluation → revocation — is now reachable entirely through
+these APIs; nothing requires direct ORM/SQLite seeding anymore.
 
 ## Demo Journey
 
 1. Open the frontend shell — product name, layout, and a live "Backend
    connected" indicator confirm the stack is wired end-to-end.
-2. (Not yet exposed via API) An original `DataAsset` exists, e.g.
-   `patient_lab_104`.
+2. `POST /assets {name: "Patient Lab Result #104", asset_type:
+   "lab_result"}` — an original `DataAsset` is created, `ACTIVE`, with no
+   parent/root/origin grant, and `SOURCE_ASSET_CREATED` is audited.
 3. `POST /grants` with an actor, purpose, `asset_id`, duration, and
    allowed operations — grant is created, `ACTIVE`, and audited.
 4. `GET /grants/{id}/status` — shows `ACTIVE` with a
@@ -1087,6 +1217,14 @@ reference it or a retrieval can happen against it.
 12. A further `POST /uses` on the now-quarantined copy is denied again
     (`ASSET_QUARANTINED`) without re-triggering quarantine, while a
     completely different sibling asset remains normally usable.
+13. `POST /grants/{id}/revoke` on a still-active grant tied to a
+    different, untouched copy — the grant's stored `status` becomes
+    `REVOKED` and `GRANT_REVOKED` is audited. `POST /uses` on that copy
+    now returns `200 {"decision": "DENY", "reason_code":
+    "GRANT_REVOKED", ...}`, and that copy becomes `QUARANTINED` — proving
+    the policy engine reacts to explicit revocation exactly like it does
+    to natural expiry, with no duplicated logic in the revoke endpoint
+    itself.
 
 (Later steps — frontend screens for everything above, e.g. an actual
 lineage graph visualization — will be appended here as each feature
@@ -1184,16 +1322,42 @@ lands.)
   (`enable_dev_endpoints`, default `True`) — a real deployment sets
   `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` to remove `clock.advance()`
   from the API surface entirely, not just rely on the path naming.
+- **`DataAssetCreate` doesn't merely ignore `parent_asset_id` /
+  `root_asset_id` / `origin_grant_id` / `state` — it doesn't accept them
+  at all** (`extra="forbid"`), the same pattern already used by
+  `CopyCreate`. A client attempting to POST a "retrieved" or "derived"
+  asset directly through `/assets` gets a `422`, not a silently-ignored
+  field; those provenance fields can only ever come from the
+  retrieval/copy services, which is the one guarantee the whole
+  purpose-seal model depends on.
+- **`POST /assets` and `POST /grants/{id}/revoke` reuse the same
+  flush-then-audit-then-commit pattern** established by the Reliability
+  Correction — no new atomicity approach was invented for these
+  operational endpoints.
+- **Grant revocation is idempotent, not error-on-repeat** — revoking an
+  already-revoked grant returns the grant as-is (`200`, `status:
+  REVOKED`) without writing a second `GRANT_REVOKED` event. A grant
+  either was or wasn't explicitly revoked; the moment it happened is a
+  fact the audit trail should record exactly once, not once per repeat
+  click/retry. A conflict response was the rejected alternative — it
+  would force every caller to special-case "already revoked" as an
+  error even though nothing actually went wrong.
+- **Revocation only flips `Grant.status`; it never touches the policy
+  engine** — `policy_service.evaluate_use` already read
+  `evaluate_grant_status(grant)` and already treated `REVOKED` as a
+  purpose-lifecycle violation (quarantine + `PURPOSE_VIOLATION`) before
+  this feature existed. `grant_service.revoke_grant` only had to make
+  `REVOKED` reachable through the API; duplicating that check inside the
+  revoke endpoint would have created two places that could disagree.
 
 ## Known Issues / Deferred Work
 
 - No way to un-quarantine an asset (no restore/appeal flow) — this
   project's scope is detection and corrective action, not remediation.
-- No revoke-grant endpoint yet, so `GRANT_REVOKED` is reachable in
-  `evaluate_grant_status`/the policy engine but not yet triggerable
-  through any API call.
 - No `UsageDecision` table — resolved as unnecessary; see the design
   decision under Database Model (Usage/policy decision entity).
+- No way to edit/rename an original asset or delete one outright — only
+  creation and listing exist; not required by any scenario so far.
 - No revocation of an individual copy/derivative independent of its
   origin grant. `GET /assets/{id}/lineage` returns the entire tree with
   no pagination — fine at hackathon scale.
@@ -1234,12 +1398,15 @@ lands.)
 - **Expiry, Policy Evaluation, and Continued-Use Violation** (major
   checkpoint milestone): recommended commit message
   `feat(policy): enforce purpose lifecycle on retrieved data`.
+- **Operational APIs — Source Asset Management and Grant Revocation**:
+  recommended commit message
+  `feat(assets): add source asset creation and grant revocation`.
 
 ## Next Step
 
 With the core loop complete (create grant → retrieve → copy/derive →
-evaluate use → detect violation → quarantine), remaining work is mostly
-rounding out the demo: a minimal endpoint to create an *original*
-`DataAsset` (still only seedable via the ORM today), a revoke-grant
-endpoint, and — per the hackathon priority list — the minimal usable
-frontend walking a judge through the whole journey end-to-end.
+evaluate use → detect violation → quarantine) and now fully reachable
+over HTTP (create original asset → revoke a grant), remaining work is
+the minimal usable frontend walking a judge through the whole journey
+end-to-end, and — later — an audit timeline view, per the hackathon
+priority list.

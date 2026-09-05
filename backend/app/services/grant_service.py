@@ -57,6 +57,45 @@ def create_grant(db: Session, payload: GrantCreate) -> Grant:
     return grant
 
 
+def revoke_grant(db: Session, grant_id: int) -> Grant:
+    """Explicitly revoke a grant. The grant row is never deleted — its
+    historical provenance and audit trail matter — only its stored
+    `status` transitions to REVOKED, the same explicit-action pattern
+    `evaluate_grant_status` already anticipated.
+
+    Idempotent by design: revoking an already-revoked grant is a safe
+    no-op that returns the grant as-is, without writing a second
+    GRANT_REVOKED event. A grant either was or wasn't explicitly revoked;
+    a duplicate call carries no new information and duplicate events
+    would misleadingly suggest multiple lifecycle transitions.
+    """
+    grant = get_grant(db, grant_id)
+    if grant.status == GrantStatus.REVOKED:
+        return grant
+
+    grant.status = GrantStatus.REVOKED
+    db.add(grant)
+
+    try:
+        db.flush()
+
+        write_audit_log(
+            db,
+            event_type="GRANT_REVOKED",
+            entity_type="grant",
+            entity_id=grant.id,
+            details={"subject": grant.subject, "purpose": grant.purpose, "asset_id": grant.asset_id},
+        )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(grant)
+    return grant
+
+
 def list_grants(db: Session) -> list[Grant]:
     return db.query(Grant).order_by(Grant.id).all()
 
