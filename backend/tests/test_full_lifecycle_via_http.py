@@ -50,8 +50,15 @@ def test_full_lifecycle_starts_and_ends_entirely_over_http(client, db_session):
     assert copy_resp.status_code == 201, copy_resp.text
     derived = copy_resp.json()
 
-    # 5. Revoke the original grant.
-    revoke_resp = client.post(f"/grants/{grant['id']}/revoke")
+    # 5. Revoke the original grant (revocation is COMPLIANCE_OFFICER/ADMIN-only).
+    client.post(
+        "/auth/register", json={"username": "compliance_01", "password": "password123", "role": "COMPLIANCE_OFFICER"}
+    )
+    login = client.post("/auth/login", json={"username": "compliance_01", "password": "password123"})
+    assert login.status_code == 200, login.text
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    revoke_resp = client.post(f"/grants/{grant['id']}/revoke", headers=headers)
     assert revoke_resp.status_code == 200, revoke_resp.text
     assert revoke_resp.json()["status"] == "REVOKED"
 

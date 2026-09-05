@@ -2,8 +2,10 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from ..db.session import get_db
+from ..models.user import UserRole
 from ..schemas.grant import GrantCreate, GrantOut, GrantStatusOut
 from ..services import grant_service
+from .deps import require_role
 
 router = APIRouter(prefix="/grants", tags=["grants"])
 
@@ -27,7 +29,11 @@ def get_grant(grant_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{grant_id}/revoke", response_model=GrantOut)
-def revoke_grant(grant_id: int, db: Session = Depends(get_db)):
+def revoke_grant(
+    grant_id: int,
+    db: Session = Depends(get_db),
+    _current_user=Depends(require_role(UserRole.COMPLIANCE_OFFICER, UserRole.ADMIN)),
+):
     grant = grant_service.revoke_grant(db, grant_id)
     return grant_service.to_grant_out(grant)
 

@@ -23,6 +23,16 @@ class ForbiddenError(AppError):
         super().__init__(403, error_code, message)
 
 
+class UnauthorizedError(AppError):
+    def __init__(self, message: str, error_code: str = "unauthorized") -> None:
+        super().__init__(401, error_code, message)
+
+
+class ConflictError(AppError):
+    def __init__(self, message: str, error_code: str = "conflict") -> None:
+        super().__init__(409, error_code, message)
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:

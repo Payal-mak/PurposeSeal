@@ -19,13 +19,20 @@ at the access-grant level.
   - `services/` — business logic (e.g. `grant_service.create_grant`,
     `audit_service.write_audit_log`), takes a DB session, returns models.
   - `models/` — SQLAlchemy ORM models (`Grant`, `DataAsset`, `AuditLog`,
-    plus shared enums `AllowedOperation`, `AssetState`, `GrantStatus`).
+    `Remediation`, `User`, plus shared enums `AllowedOperation`,
+    `AssetState`, `GrantStatus`, `RemediationStatus`, `UserRole`).
   - `schemas/` — Pydantic request/response schemas.
   - `db/` — `base.py` (declarative `Base`) and `session.py` (engine,
     `SessionLocal`, `get_db`, `init_db`).
   - `core/` — cross-cutting concerns: `config.py` (centralized
     `Settings`), `clock.py` (time abstraction), `errors.py` (`AppError`
-    hierarchy + exception handlers).
+    hierarchy + exception handlers), `security.py` (password hashing +
+    access tokens — see "Actor Roles and Minimal Authentication" under
+    Implemented Features).
+  - `api/deps.py` — authentication/role-authorization dependencies
+    (`get_current_user`, `get_current_user_optional`, `require_role`),
+    deliberately separate from `services/policy_service.py`'s purpose
+    authorization — see the same feature entry for why.
 - **Frontend**: React 19 + Vite 8 + Tailwind CSS v4 (via `@tailwindcss/vite`,
   no separate `tailwind.config.js`/PostCSS needed under v4). `Layout`
   (header with product name + placeholder nav) and `HealthIndicator`
@@ -115,6 +122,19 @@ at the access-grant level.
     into that already-deferred idea, and the feature entry under
     Implemented Features for full reasoning. Rows here are never
     deleted.
+- **User** (`users` table, added by the Actor Roles and Minimal
+  Authentication feature) — a login identity: "who is this caller, and
+  what role do they hold." Deliberately **not** referenced by
+  `Grant`/`DataAsset`/`AuditLog`/`Remediation` via foreign key — those
+  keep their existing free-text `subject`/`actor` strings unchanged.
+  See "Actor Roles and Minimal Authentication" under Implemented
+  Features for why authentication intentionally doesn't reach into the
+  domain model beyond setting what string gets used at the API
+  boundary.
+  - `id`, `username` (unique), `password_hash`, `password_salt`
+    (PBKDF2-SHA256, see `core/security.py`), `role` (`UserRole` —
+    `RESEARCHER` / `CLINICIAN` / `ANALYST` / `COMPLIANCE_OFFICER` /
+    `ADMIN`), `created_at`.
 
 ### Original Asset → Purpose Grant → Retrieved/Derived Asset
 
@@ -1685,11 +1705,190 @@ POST /demo/scenarios/expired
   querying `AuditLog`/the `Remediation` table directly (fine for this
   project's current query needs).
 
+### Actor Roles and Minimal Authentication
+
+**Goal**: minimal login/roles appropriate for a hackathon MVP, without
+building SSO/OAuth and — critically — without letting "this login is
+valid" be confused with "this data use is authorized." Before writing
+any code, the repository was searched for existing auth (`grep -r
+auth`) and found none, and both test suites (120 backend, 21 frontend)
+were confirmed green first, per the task's explicit "only implement if
+the core demo is stable."
+
+**The authentication/purpose-authorization boundary, explained**: this
+project has always had two independent questions in play, and this
+feature makes the second one explicit for the first time:
+
+1. *Authentication*: "is this really who they claim to be, and are
+   they the kind of actor (role) allowed to attempt this operation at
+   all?" — new in this feature (`core/security.py`, `api/deps.py`,
+   `POST /auth/login`).
+2. *Purpose authorization*: "is this specific attempted use of this
+   specific asset within the purpose, expiry, and operation a grant
+   actually authorized?" — the policy engine, unchanged, and unaware
+   this feature exists.
+
+A user can authenticate perfectly (correct password, valid token,
+permitted role) and still have every `/uses` call `DENY`, because
+`evaluate_use` never asks "was this caller properly logged in" — it
+only ever asks "does a grant say this purpose/operation/actor/time is
+valid." Conversely, a role check passing (e.g., a `COMPLIANCE_OFFICER`
+token accepted for `POST /grants/{id}/revoke`) says nothing about
+whether any particular grant *should* be revoked — that's still a
+business decision the caller makes, not something the auth layer
+evaluates. `api/deps.py`'s module docstring and `models/user.py`'s
+`UserRole` docstring both restate this; `policy_service.py` was not
+touched at all by this feature (verified: `git diff` touches no policy
+file), which is the clearest proof the two systems stayed independent.
+
+- **Roles**: `RESEARCHER`, `CLINICIAN`, `ANALYST`, `COMPLIANCE_OFFICER`,
+  `ADMIN` (`UserRole` enum) — all five named in the task, none omitted,
+  none given special-cased behavior beyond the one role-gated operation
+  below (no other requirement implied more).
+- **No new dependencies**: this project had zero crypto libraries
+  before this feature (`requirements.txt` still only lists
+  fastapi/uvicorn/sqlalchemy/pydantic/pydantic-settings/httpx/pytest).
+  Rather than adding `passlib`/`pyjwt`/`bcrypt`, `core/security.py`
+  hand-rolls both pieces from the standard library: password hashing
+  via `hashlib.pbkdf2_hmac` (a NIST-recommended KDF) with a random
+  per-user salt, and a genuine HS256 JWT (header.payload.signature,
+  base64url, HMAC-SHA256, `hmac.compare_digest` for constant-time
+  verification) — not a JWT-*like* format, an actual correct minimal
+  implementation of the open standard. This was a judgment call, not a
+  requirement: "use a simple secure approach appropriate to the
+  existing architecture" was read as license to keep the zero-new-
+  dependency pattern this project has followed throughout, given a
+  correct implementation was straightforward with the standard library
+  alone. PBKDF2 iterations are set to 100,000 (a legitimate, commonly-
+  cited baseline, below OWASP's current 600,000+ recommendation) so a
+  test suite registering/logging in many users stays fast — documented
+  in `core/security.py` as a tradeoff a real deployment should revisit.
+- **Token timestamps use the project's simulated `clock`**, not real
+  wall-clock time — the same single "now" source as grants, retrievals,
+  and everything else, so a demo scenario advancing simulated time
+  can't produce surprising token-expiry behavior, and token expiry is
+  just as deterministic/testable as the rest of the system.
+- **`POST /auth/register`, `POST /auth/login`, `GET /auth/me`** — the
+  whole auth surface. Registration is open to anyone for any role,
+  including `ADMIN`/`COMPLIANCE_OFFICER` — a real deployment would gate
+  who can self-assign the higher-privilege roles; left open here for
+  hackathon-scope simplicity (documented as a known limitation below).
+- **Exactly one role-restricted operation**: `POST /grants/{id}/revoke`
+  now requires authentication outright (`get_current_user`, 401
+  without a valid token) and requires the `COMPLIANCE_OFFICER` or
+  `ADMIN` role (`require_role(...)`, 403 otherwise) — revoking access
+  is a compliance/governance action, a natural, minimal choice of
+  "which operation" to gate rather than gating everything. No other
+  endpoint's authorization requirements changed.
+- **Identity cannot be spoofed through the request body, for the three
+  endpoints where the body's `actor` field represents "who is
+  performing this action right now"**: `POST /retrievals`,
+  `POST /copies`, `POST /uses`. Each now takes an *optional*
+  authenticated user (`get_current_user_optional` — never raises); when
+  a valid Bearer token is present, the request's `actor` is
+  unconditionally replaced with the token's username before the
+  payload reaches any service function
+  (`payload.model_copy(update={"actor": ...})` at the API boundary —
+  zero changes to `retrieval_service.py`/`copy_service.py`/
+  `policy_service.py`). A request with **no** Authorization header
+  behaves exactly as before this feature — all 120 prior backend tests
+  pass unmodified. `POST /grants`'s `subject` field was deliberately
+  **not** touched: it represents who a grant is issued *to*, which
+  legitimately may differ from who's creating it (e.g., an admin
+  issuing a grant to a researcher) — overriding it would break that
+  case and doesn't fit "who is performing this action right now" the
+  way `actor` does on the other three endpoints.
+
+**Worked example (from a live server)**:
+```
+POST /auth/register {"username": "researcher_01", "password": "password123", "role": "RESEARCHER"}
+-> 201 {"id": 1, "username": "researcher_01", "role": "RESEARCHER", ...}
+
+POST /auth/login {"username": "researcher_01", "password": "wrong"}
+-> 401 {"error_code": "invalid_credentials", ...}
+
+POST /auth/login {"username": "researcher_01", "password": "password123"}
+-> 200 {"access_token": "eyJhbGci...", "token_type": "bearer", "role": "RESEARCHER", ...}
+
+POST /grants/3/revoke                                    (no token)
+-> 401 {"error_code": "not_authenticated", ...}
+
+POST /grants/3/revoke   Authorization: Bearer <researcher_01's token>
+-> 403 {"error_code": "role_not_permitted",
+        "message": "Role 'RESEARCHER' is not permitted to perform this operation."}
+
+POST /grants/3/revoke   Authorization: Bearer <compliance_01's token>
+-> 200 {"status": "REVOKED", ...}
+
+POST /retrievals   Authorization: Bearer <researcher_01's token>
+                    {"grant_id": 3, "actor": "mallory", "asset_id": 5, "operation": "VIEW"}
+-> 201 {...}   -- succeeded because the grant's subject is researcher_01,
+                  which is who the token says this really is; "mallory"
+                  in the body was never used (confirmed by inspecting the
+                  DATA_RETRIEVED audit event's `details.actor`, which
+                  reads "researcher_01").
+```
+
+- **Files added**: `backend/app/models/user.py`,
+  `backend/app/core/security.py`, `backend/app/schemas/auth.py`,
+  `backend/app/services/auth_service.py`, `backend/app/api/deps.py`,
+  `backend/app/api/auth.py`, `backend/tests/test_auth.py`.
+- **Files modified**: `backend/app/models/__init__.py`,
+  `backend/app/schemas/__init__.py`, `backend/app/api/__init__.py`,
+  `backend/app/core/config.py` (+`secret_key`), `backend/app/core/
+  errors.py` (+`UnauthorizedError` 401, +`ConflictError` 409),
+  `backend/app/api/grants.py` (role-gated revoke),
+  `backend/app/api/{retrievals,copies,uses}.py` (optional
+  authenticated-identity override), `backend/tests/
+  {test_grant_revocation,test_full_lifecycle_via_http}.py` (revoke
+  calls now authenticate as a `COMPLIANCE_OFFICER` first — a
+  deliberate, documented behavior change, not a weakened test).
+- **Tests added** (15 in `test_auth.py`, covering all 6 required cases
+  plus extras): unauthenticated protected request (`revoke` without a
+  token → 401); valid login returns a usable token; wrong credentials
+  → 401 (plus a nonexistent-username variant); role-restricted
+  operation (`RESEARCHER`/`ANALYST`/`CLINICIAN` → 403 revoking,
+  `COMPLIANCE_OFFICER`/`ADMIN` → 200); an authenticated, correctly-
+  identified actor is still `DENY`/`PURPOSE_MISMATCH`'d by the policy
+  engine on a wrong-purpose use (the authentication/purpose-
+  authorization boundary, directly tested); identity cannot be spoofed
+  through the request body (valid token for researcher_01, body claims
+  `actor: "mallory"` → the retrieval succeeds as researcher_01, and the
+  audit trail itself records `"actor": "researcher_01"`, never
+  "mallory"); duplicate registration rejected (409); invalid/malformed
+  token rejected (401); unauthenticated request behavior is provably
+  unchanged from before this feature.
+- **Test result**: backend `135 passed` (120 prior + 15 new; two
+  revoke-related tests in other files updated to authenticate first,
+  not weakened), zero regressions. Frontend `21 passed`, completely
+  unaffected (the dashboard never calls `POST /grants/{id}/revoke` or
+  any of the three actor-bearing write endpoints — it only reads
+  `GET /grants`/`GET /assets`/lineage and runs demo scenarios, none of
+  which changed). Also manually verified live via `uvicorn`: full
+  register → wrong-password-rejected → login → unauthenticated-401 →
+  wrong-role-403 → right-role-200 → spoofing-attempt-still-correctly-
+  attributed sequence, exactly as shown above.
+- **Known limitations**: registration is open to anyone for any role
+  (no gate on self-assigning `ADMIN`/`COMPLIANCE_OFFICER`) — acceptable
+  for a hackathon demo, would need restricting in a real deployment.
+  `Grant.subject` is still an unverified free-text string with no
+  role/identity restriction on `POST /grants` itself — only revocation
+  and the three actor-bearing endpoints are auth-aware; a real
+  deployment would likely also restrict who may issue a grant. No
+  token refresh/logout/revocation (tokens are valid for their full
+  60-minute lifetime once issued — fine for a demo session). No
+  password reset flow. `PURPOSESEAL_SECRET_KEY` has an obviously-
+  insecure default that must be overridden outside local development
+  (documented inline in `core/config.py`).
+
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | GET | /health | Liveness check — `{status, app_name}` |
+| POST | /auth/register | Create a login identity (`username`, `password`, `role`); open to any of the five roles |
+| POST | /auth/login | Exchange credentials for an access token; `401 invalid_credentials` on failure |
+| GET | /auth/me | Return the authenticated caller's identity; `401` without a valid token |
 | POST | /assets | Create an original/root `DataAsset` (`name`, `asset_type` only — provenance fields are server-controlled) |
 | GET | /assets | List assets; optional `state`, `asset_type`, `root_only` filters |
 | GET | /assets/{id} | Get one asset by id, with its purpose seal resolved |
@@ -1698,10 +1897,10 @@ POST /demo/scenarios/expired
 | GET | /grants | List all grants (with live-evaluated `status`) |
 | GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
 | GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
-| POST | /grants/{id}/revoke | Explicitly revoke a grant (persists `status: REVOKED` + `GRANT_REVOKED` audit event); idempotent — repeat calls return the already-revoked grant without a duplicate event |
-| POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` |
-| POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant |
-| POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at, remediation, remediation_status}` — the last two are populated only for a purpose-lifecycle violation |
+| POST | /grants/{id}/revoke | **Requires authentication + `COMPLIANCE_OFFICER`/`ADMIN` role.** Explicitly revoke a grant (persists `status: REVOKED` + `GRANT_REVOKED` audit event); idempotent — repeat calls return the already-revoked grant without a duplicate event |
+| POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code`. If a valid Bearer token is present, `actor` is taken from it, not the body |
+| POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant. Same Bearer-token `actor` override as `/retrievals` |
+| POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at, remediation, remediation_status}` — the last two are populated only for a purpose-lifecycle violation. Same Bearer-token `actor` override as `/retrievals` — note this never changes the decision logic itself, only whose identity it's evaluated against |
 | GET | /dev/clock | **Simulation only** — current simulated time |
 | POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
 | POST | /demo/scenarios/legitimate | **Simulation only** — runs the full legitimate-use journey in one call; returns the decision (`ALLOW`) and its complete audit timeline |
@@ -2064,6 +2263,33 @@ lands.)
   asked to make remediation visible and persistent, not to build a
   full review lifecycle; a `RESOLVED`/`DISMISSED` status and an
   endpoint to set it are natural, separately-scoped future work.
+- **Authentication and purpose authorization are two independent
+  systems that never import from each other** — `api/deps.py` (roles,
+  tokens) and `services/policy_service.py` (purpose/expiry/operation)
+  don't reference one another at all. This is the central design
+  decision of "Actor Roles and Minimal Authentication"; see that
+  feature entry for the full explanation and worked proof.
+- **Hand-rolled HS256 JWT + PBKDF2 password hashing, standard library
+  only** — no `pyjwt`/`passlib`/`bcrypt` added. This project had zero
+  crypto dependencies before this feature and a correct minimal HS256
+  implementation was straightforward with `hmac`/`hashlib`/`base64`
+  alone; judged as staying truer to "simple, appropriate to the
+  existing architecture" than introducing a new dependency category.
+- **Token timestamps use the simulated `clock`, not wall-clock time**
+  — consistent with every other time-sensitive concept in this project
+  (grant expiry, demo scenarios); a token's expiry is exactly as
+  deterministic and simulated-clock-aware as a grant's.
+- **Only `POST /grants/{id}/revoke` is role-gated; only
+  `POST /retrievals`/`POST /copies`/`POST /uses` get the Bearer-token
+  `actor` override** — a deliberately narrow first cut rather than
+  retrofitting authentication onto every endpoint. `GET` endpoints and
+  the dev/demo endpoints are completely unaffected, so the existing
+  dashboard needed zero changes.
+- **`POST /grants`'s `subject` field is not overridden by an
+  authenticated identity** — unlike `actor` on the other three
+  endpoints, `subject` represents who a grant is issued *to*, which
+  can legitimately differ from who's creating it; overriding it would
+  break "issue a grant to someone else" as a use case.
 
 ## Known Issues / Deferred Work
 
@@ -2107,6 +2333,21 @@ lands.)
   overlap for a wide branching tree (depth/sibling-order only) — fine
   for this project's shallow, mostly-linear trees; a genuinely bushy
   tree would need a real layout library.
+- No role/identity gate on `POST /auth/register` (anyone can self-
+  register as `ADMIN`/`COMPLIANCE_OFFICER`), no token
+  refresh/logout/revocation, no password reset flow — all deliberate
+  hackathon-MVP scope cuts for the Actor Roles and Minimal
+  Authentication feature. `POST /grants`'s `subject` remains an
+  unverified free-text string; only revocation and the three actor-
+  bearing write endpoints are auth-aware today.
+- The frontend dashboard has no login screen — every write it makes
+  goes through unauthenticated paths (`POST /demo/scenarios/*` calling
+  services directly, bypassing the HTTP auth layer entirely) or GET
+  requests that were never auth-gated, so this was a deliberate choice
+  to avoid touching the working demo, not an oversight. Wiring a login
+  flow into the dashboard (so real Bearer-token demos of role
+  restriction and identity-override are visible in the UI, not just
+  via `curl`/tests) is natural future work.
 - No literal browser/click-through verification tooling in this
   environment (no Playwright/Puppeteer installed) — the dashboard
   feature's manual verification confirmed the full API request/response
@@ -2157,17 +2398,23 @@ lands.)
   message `feat(lineage-ui): visualize purpose-bound data provenance`.
 - **Stronger Remediation Workflow**: recommended commit message
   `feat(remediation): persist violation response workflow`.
+- **Actor Roles and Minimal Authentication**: recommended commit
+  message `feat(auth): add role-aware actor authentication`.
 
 ## Next Step
 
 The full PurposeSeal loop (create grant → retrieve → copy/derive →
 evaluate use → detect violation → quarantine → persist remediation) is
 complete, reachable entirely over HTTP, demoable in three single-call
-scenarios, and has a judge-ready dashboard with a live
-Summary/Result/Timeline/Lineage-graph view, including remediation
-status — see "Judge demo via the dashboard" above for exact demo
-steps. Remaining work, in rough priority order: a real
-browser/click-through verification pass once a browser-automation tool
-is available (see Known Issues), a dedicated global audit-trail view
-(beyond the per-scenario timeline), and — if ever requested — a
-resolve/dismiss workflow for an open `Remediation`.
+scenarios, has a judge-ready dashboard with a live
+Summary/Result/Timeline/Lineage-graph view, and now has minimal
+role-aware authentication sitting alongside (not inside) the purpose
+policy engine — see "Judge demo via the dashboard" above for the
+unauthenticated demo flow, and "Actor Roles and Minimal Authentication"
+for the auth-specific worked example. Remaining work, in rough
+priority order: a real browser/click-through verification pass once a
+browser-automation tool is available (see Known Issues), a dedicated
+global audit-trail view (beyond the per-scenario timeline), a
+resolve/dismiss workflow for an open `Remediation` if ever requested,
+and — if the auth surface needs to be judge-visible, not just
+API-visible — a login screen in the dashboard.

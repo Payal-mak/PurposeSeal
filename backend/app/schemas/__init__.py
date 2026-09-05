@@ -1,3 +1,4 @@
+from .auth import LoginRequest, TokenOut, UserOut, UserRegister
 from .copy import CopyCreate
 from .data_asset import DataAssetCreate, DataAssetOut
 from .demo import DemoScenarioOut, TimelineEventOut
@@ -24,4 +25,8 @@ __all__ = [
     "ClockStateOut",
     "DemoScenarioOut",
     "TimelineEventOut",
+    "LoginRequest",
+    "TokenOut",
+    "UserOut",
+    "UserRegister",
 ]

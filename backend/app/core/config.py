@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     # for anything resembling a real deployment.
     enable_dev_endpoints: bool = True
 
+    # Signs access tokens (see core/security.py). This default is
+    # intentionally obviously-insecure and MUST be overridden via
+    # PURPOSESEAL_SECRET_KEY outside local development -- anyone who
+    # knows this value can forge a valid login for any user/role.
+    secret_key: str = "dev-only-insecure-secret-change-in-production"
+
 
 @lru_cache
 def get_settings() -> Settings:
