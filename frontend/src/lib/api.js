@@ -30,6 +30,10 @@ export async function listGrants() {
   return request('/grants')
 }
 
+export async function getGrant(grantId) {
+  return request(`/grants/${grantId}`)
+}
+
 export async function listAssets(params = {}) {
   const query = new URLSearchParams(params).toString()
   return request(`/assets${query ? `?${query}` : ''}`)
@@ -37,6 +41,10 @@ export async function listAssets(params = {}) {
 
 export async function getAsset(assetId) {
   return request(`/assets/${assetId}`)
+}
+
+export async function getLineage(assetId) {
+  return request(`/assets/${assetId}/lineage`)
 }
 
 export async function runScenario(scenarioKey) {

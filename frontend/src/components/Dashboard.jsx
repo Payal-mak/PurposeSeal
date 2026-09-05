@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 
-import { getAsset, listAssets, listGrants, runScenario } from '../lib/api'
+import { getAsset, getGrant, getLineage, listAssets, listGrants, runScenario } from '../lib/api'
 import JourneyTimeline from './JourneyTimeline'
+import LineageGraph from './LineageGraph'
 import ScenarioControls from './ScenarioControls'
 import ScenarioResult from './ScenarioResult'
 import SummaryMetrics from './SummaryMetrics'
@@ -34,6 +35,10 @@ export default function Dashboard() {
   const [runningKey, setRunningKey] = useState(null)
   const [result, setResult] = useState(null)
   const [scenarioError, setScenarioError] = useState(null)
+
+  const [lineage, setLineage] = useState(null)
+  const [grantStatusById, setGrantStatusById] = useState({})
+  const [lineageError, setLineageError] = useState(null)
 
   const refreshLiveMetrics = useCallback(async () => {
     try {
@@ -75,12 +80,14 @@ export default function Dashboard() {
       let assetLabel = `Asset #${response.asset_id}`
       let originalPurpose = findEventDetail(timeline, 'GRANT_CREATED', 'purpose') ?? 'Unknown'
       let expiry = formatTimestamp(findEventDetail(timeline, 'GRANT_CREATED', 'expires_at'))
+      let rootAssetId = response.asset_id
 
       try {
         const asset = await getAsset(response.asset_id)
         assetLabel = `${asset.name} (#${asset.id})`
         if (asset.origin_purpose) originalPurpose = asset.origin_purpose
         if (asset.origin_grant_expires_at) expiry = formatTimestamp(asset.origin_grant_expires_at)
+        rootAssetId = asset.root_asset_id ?? asset.id
       } catch {
         // Asset detail is a nice-to-have for a friendlier label; the
         // timeline-derived values above already cover the essentials.
@@ -106,11 +113,30 @@ export default function Dashboard() {
       }
 
       await refreshLiveMetrics()
+      await loadLineage(rootAssetId)
     } catch (err) {
       setScenarioError(err.message)
       setResult(null)
+      setLineage(null)
     } finally {
       setRunningKey(null)
+    }
+  }
+
+  const loadLineage = async (rootAssetId) => {
+    try {
+      const lineageData = await getLineage(rootAssetId)
+
+      const uniqueGrantIds = [...new Set(lineageData.nodes.map((node) => node.origin_grant_id).filter(Boolean))]
+      const grants = await Promise.all(uniqueGrantIds.map((grantId) => getGrant(grantId)))
+      const statusById = Object.fromEntries(grants.map((grant) => [grant.id, grant.status]))
+
+      setGrantStatusById(statusById)
+      setLineage(lineageData)
+      setLineageError(null)
+    } catch (err) {
+      setLineageError(err.message)
+      setLineage(null)
     }
   }
 
@@ -141,6 +167,11 @@ export default function Dashboard() {
       <section>
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-500">Journey Timeline</h2>
         <JourneyTimeline timeline={result?.timeline} />
+      </section>
+
+      <section>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-500">Data Lineage</h2>
+        <LineageGraph lineage={lineage} grantStatusById={grantStatusById} error={lineageError} />
       </section>
     </div>
   )

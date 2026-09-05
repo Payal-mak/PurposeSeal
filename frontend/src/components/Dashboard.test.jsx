@@ -26,14 +26,30 @@ const DEFAULT_ASSET_DETAIL = {
   created_at: '2026-01-01T00:00:00Z',
 }
 
-function stubFetch({ scenario, assets = [], quarantinedAssets = [], grants = [], assetDetail } = {}) {
+const DEFAULT_LINEAGE = {
+  root_asset_id: 1,
+  nodes: [DEFAULT_ASSET_DETAIL],
+  edges: [],
+}
+
+function stubFetch({
+  scenario,
+  assets = [],
+  quarantinedAssets = [],
+  grants = [],
+  assetDetail,
+  lineage,
+  grantDetail,
+} = {}) {
   const fetchMock = vi.fn((url) => {
     const { pathname, search } = new URL(url)
 
     if (pathname === '/grants') return jsonResponse(grants)
     if (pathname === '/assets' && search.includes('QUARANTINED')) return jsonResponse(quarantinedAssets)
     if (pathname === '/assets') return jsonResponse(assets)
+    if (/^\/assets\/\d+\/lineage$/.test(pathname)) return jsonResponse(lineage ?? DEFAULT_LINEAGE)
     if (pathname.startsWith('/assets/')) return jsonResponse(assetDetail ?? DEFAULT_ASSET_DETAIL)
+    if (/^\/grants\/\d+$/.test(pathname)) return jsonResponse(grantDetail ?? { ...grants[0], status: 'ACTIVE' })
     if (pathname.startsWith('/demo/scenarios/') && scenario) return scenario(pathname)
 
     return jsonResponse({})
@@ -187,6 +203,24 @@ describe('Dashboard', () => {
     expect(screen.getByText(/issue a new purpose grant/i)).toBeInTheDocument()
     expect(screen.getByText(/purpose expired.*violation detected/i)).toBeInTheDocument()
     expect(screen.getByText(/asset quarantined/i)).toBeInTheDocument()
+  })
+
+  it('loads and displays the lineage graph for the evaluated asset after a scenario run', async () => {
+    const lineage = {
+      root_asset_id: 1,
+      nodes: [
+        { ...DEFAULT_ASSET_DETAIL, id: 1, name: 'Patient Lab Result #104' },
+        { ...DEFAULT_ASSET_DETAIL, id: 3, name: 'Retrieved Copy', parent_asset_id: 1, root_asset_id: 1, origin_grant_id: 1 },
+      ],
+      edges: [{ parent_id: 1, child_id: 3 }],
+    }
+    stubFetch({ scenario: () => jsonResponse(ALLOW_RESPONSE), lineage, grantDetail: { id: 1, status: 'ACTIVE' } })
+    render(<Dashboard />)
+
+    fireEvent.click(screen.getByRole('button', { name: /run valid scenario/i }))
+
+    expect(await screen.findByText('Patient Lab Result #104')).toBeInTheDocument()
+    expect(screen.getByText('Retrieved Copy')).toBeInTheDocument()
   })
 
   it('shows a readable error message when the scenario request fails, without crashing, and allows a rerun', async () => {

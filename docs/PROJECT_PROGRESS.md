@@ -30,10 +30,12 @@ at the access-grant level.
   no separate `tailwind.config.js`/PostCSS needed under v4). `Layout`
   (header with product name + placeholder nav) and `HealthIndicator`
   (polls backend `/health` on mount) wrap a single `Dashboard` screen —
-  see "Minimal Judge-Ready Dashboard" under Implemented Features. All API
-  calls go through `src/lib/api.js` (a thin `fetch` wrapper reading
-  `VITE_API_BASE_URL`, default `http://localhost:8000`), never a raw
-  `fetch()` call inside a component.
+  see "Minimal Judge-Ready Dashboard" and "Interactive Data Lineage
+  Visualization" under Implemented Features. Data lineage renders via
+  `@xyflow/react` (React 19-compatible; no graph database, no separate
+  backend). All API calls go through `src/lib/api.js` (a thin `fetch`
+  wrapper reading `VITE_API_BASE_URL`, default `http://localhost:8000`),
+  never a raw `fetch()` call inside a component.
 - **Time handling**: a single `Clock` singleton (`app/core/clock.py`) is
   the only source of "now" for business logic. It wraps real UTC time plus
   an in-memory offset that can be advanced (`clock.advance(minutes=...)`)
@@ -1404,6 +1406,131 @@ no configuration change needed.
   dashboard is the only screen, matching the "one main dashboard"
   instruction.
 
+### Interactive Data Lineage Visualization
+
+**Goal**: show a judge, visually, "where did this data come from and
+which copies are affected?" — a graph rendering of the existing
+`GET /assets/{id}/lineage` endpoint (no backend changes; purely a new
+frontend consumer). No graph database was introduced — the backend
+already answers lineage with one SQL query via the denormalized
+`root_asset_id` column (see Database Model); this feature only draws
+that response.
+
+- **`LineageGraph.jsx`**, built on `@xyflow/react` (peer deps
+  `react >=17`, compatible with this project's React 19 — confirmed via
+  `npm view` before installing). Renders one custom node per asset
+  (name + status badge) connected by edges built directly from the
+  lineage response's `edges` array (`{parent_id, child_id}` →
+  `{source, target}`).
+- **Layout is a small hand-rolled layered algorithm** (`computeLayout`:
+  BFS depth from the root via the edge list → row; sibling order →
+  column), not a graph-layout library (dagre/elkjs) — this project's
+  lineage trees are shallow and mostly linear (the exact
+  `Patient Lab Record → Retrieved Copy → Analysis Dataset → Derived
+  Report` chain the task named), so a dependency for arbitrary-graph
+  auto-layout would be solving a harder problem than the one this app
+  actually has.
+- **Per-node status is computed from two authoritative backend
+  signals, never a client-side clock comparison**: `state ===
+  'QUARANTINED'` on the asset itself is definitive; otherwise, the
+  node's shared `origin_grant_id` is looked up via `GET /grants/{id}`
+  and that grant's live `status` (already computed server-side by
+  `evaluate_grant_status` against the *simulated* clock) maps
+  `EXPIRED` → "PURPOSE EXPIRED" and `REVOKED` → "GRANT REVOKED";
+  anything else (including a root asset with no origin grant) is
+  "ACTIVE". A wall-clock comparison in the browser was deliberately
+  rejected: this project's expiry is evaluated against `clock.now()`
+  (real time + a simulated offset advanced by demo scenarios), which a
+  browser's `Date.now()` cannot see, and a naive comparison would show
+  a demo-expired grant as still active for real minutes after the
+  dashboard already reported it expired.
+- **One grant lookup per lineage tree, not per node** — `copy_service`
+  always inherits `origin_grant_id` from the parent asset's existing
+  grant (never issues a new one), so an entire retrieved/derived
+  subtree shares exactly one grant id; the dashboard collects the
+  *unique* `origin_grant_id` values across all lineage nodes (typically
+  zero or one) before fetching, not one request per node.
+- **Clicking a node** shows asset name/id, parent, root, associated
+  grant, original purpose, expiry, and current status in a side panel —
+  exactly the fields the task specified, sourced entirely from the
+  already-fetched `DataAssetOut` node plus the same status computation
+  used for the node's badge.
+- **Not editable**: `nodesDraggable={false}`, `nodesConnectable={false}`,
+  no add/remove/reconnect handlers wired — a pure, read-only view, per
+  the task's explicit instruction.
+- **Integrated into the existing dashboard, not a separate screen** —
+  after any scenario run, the dashboard resolves the evaluated asset's
+  root (already has the asset detail from the Result panel's own
+  fetch) and loads that root's lineage into a new "Data Lineage"
+  section below the Journey Timeline. A lineage-fetch failure sets its
+  own independent error state and never blanks out the
+  already-successful Result/Timeline sections above it.
+
+**Testing @xyflow/react in jsdom required three environment stubs**
+(`src/setupTests.js`), discovered by tracing actual library source
+rather than guessing:
+1. `ResizeObserver` — jsdom has none; xyflow uses one to detect when to
+   measure a node. The stub must fire **asynchronously** (`setTimeout`,
+   not synchronously inside `observe()`) — firing synchronously races
+   ahead of the root wrapper's own mount effect (which registers the
+   DOM node xyflow later measures against), so the update is silently
+   dropped.
+2. `Element.prototype.getBoundingClientRect` / `offsetWidth` /
+   `offsetHeight` — jsdom reports 0 for all of these (no real layout
+   engine); xyflow refuses to draw edges between unmeasured (0-size)
+   nodes, so both are stubbed to a fixed plausible size.
+3. `DOMMatrixReadOnly` — jsdom doesn't implement it at all; xyflow
+   parses the viewport's CSS transform through it to read the current
+   zoom level on every measurement pass. A minimal `{m22: 1}`
+   (identity-scale) stub is enough since tests never pan/zoom.
+
+Without all three, nodes render but stay permanently
+`visibility: hidden` and zero edges ever appear — a state that looks
+like "the component doesn't work" but is actually "jsdom cannot answer
+the layout questions this library asks," a real environment gap rather
+than a defect in `LineageGraph.jsx` itself.
+
+- **Files added**: `frontend/src/components/{LineageGraph,
+  LineageGraph.test.jsx}`.
+- **Files modified**: `frontend/src/components/Dashboard.jsx` (added
+  the lineage-loading call after each scenario run and the new "Data
+  Lineage" section), `frontend/src/lib/api.js` (added `getGrant`,
+  `getLineage`), `frontend/src/setupTests.js` (the three stubs above),
+  `frontend/package.json` (added `@xyflow/react`).
+- **Tests added**: 7 in `LineageGraph.test.jsx` (renders every node
+  from the API; renders an edge for every parent/child relationship;
+  makes `QUARANTINED` visible on the affected node; shows
+  `PURPOSE EXPIRED` when the shared origin grant has expired; handles
+  empty/missing lineage without crashing; handles an API error
+  gracefully; clicking a node reveals its asset/parent/root/grant/
+  purpose/expiry/status details) plus 1 new integration test in
+  `Dashboard.test.jsx` confirming the lineage graph actually renders
+  real nodes after a scenario run through the full component tree
+  (not just the isolated `LineageGraph` component).
+- **Test result**: frontend `21 passed` (13 prior Dashboard-suite tests
+  + 7 new LineageGraph tests + 1 new Dashboard integration test);
+  backend regression `112 passed, 2 warnings in ~22s` — zero
+  regressions, no backend changes at all for this feature.
+- **Manual verification**: `npm run build` succeeded (`@xyflow/react`
+  bundles cleanly, 382.81 kB / 121.52 kB gzipped). Against a live
+  backend, ran the expired-purpose scenario, then replayed the exact
+  calls the dashboard makes (`GET /assets/{id}` to find the root,
+  `GET /assets/{root}/lineage`, `GET /grants/{id}` for the shared
+  origin grant) and confirmed the live response matches what
+  `computeNodeStatus` needs and produces the intended labels: root
+  asset → `ACTIVE` (no origin grant), retrieved copy → `PURPOSE
+  EXPIRED` (shared grant's live `status: "EXPIRED"`), derived copy →
+  `QUARANTINED` (its own `state`).
+- **Known limitations**: no literal browser click-through (same gap as
+  the dashboard feature — no browser-automation tool available here).
+  The hand-rolled layout doesn't attempt to avoid edge/node overlap for
+  a wide branching tree (only depth/sibling-order based) — acceptable
+  for this project's shallow, mostly-linear lineage trees; a genuinely
+  bushy tree would need a real layout library. Grant-status lookups are
+  not cached across multiple lineage loads in the same session (a
+  fresh `GET /grants/{id}` call every time a scenario re-triggers a
+  lineage load) — negligible cost at this scale.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -1460,19 +1587,28 @@ one browser tab, three button clicks.
    the grant's expiry, the asset, and "no action needed." The Journey
    Timeline below shows six steps ending in "Use Allowed." Active
    Grants and Tracked Copies in the Summary row update to reflect the
-   new grant/copies.
+   new grant/copies. Below the timeline, **Data Lineage** now shows a
+   small graph: the original asset → its retrieved copy, both labeled
+   `ACTIVE`.
 5. **Click "Run Expired-Purpose Scenario."** Result flips to
    **BLOCKED**, reason names the expired grant, and Corrective Action
    suggests issuing a new grant. The timeline ends in "Purpose Expired
    — Violation Detected" → "Asset Quarantined." Quarantined Assets in
    the Summary row goes from `0` to `1`; Violations Detected goes from
-   `0` to `1`.
+   `0` to `1`. Data Lineage now shows the full chain from this
+   scenario — root asset `ACTIVE`, its retrieved copy `PURPOSE
+   EXPIRED` (the shared grant expired), the derived copy
+   `QUARANTINED`. **Click the quarantined node** — the side panel shows
+   its asset id, parent, root, associated grant, original purpose,
+   expiry, and status in one place.
 6. **Click "Run Purpose-Mismatch Scenario."** Result again shows
    **BLOCKED**, this time naming `clinical_trial_screening` as the
    original purpose and `marketing_analytics` as the requested one.
    Timeline ends in "Purpose Mismatch — Violation Detected" → "Asset
    Quarantined." Quarantined Assets becomes `2`, Violations Detected
-   becomes `2`.
+   becomes `2`. Data Lineage updates to this scenario's own chain,
+   ending in a `QUARANTINED` node — visually answering "which copy was
+   affected, and the original source data was never touched."
 7. **Re-run any scenario as many times as you like** — every click
    creates a fresh asset/grant chain (no collisions, no manual
    cleanup), so the demo can be repeated live without restarting
@@ -1728,6 +1864,22 @@ lands.)
   writes from interleaving with the first's mid-flight timeline/metrics
   refresh, keeping the result panel and summary numbers consistent with
   exactly one completed run at a time.
+- **Lineage node status is computed from `GET /grants/{id}`'s live
+  `status`, never a browser-side clock comparison** — this project's
+  expiry is evaluated against a *simulated* clock (`clock.now()`), and
+  only the backend can see it; comparing `origin_grant_expires_at`
+  against the browser's real `Date.now()` would show a demo-expired
+  grant as still active for real minutes after the backend already
+  quarantined its data. See the lineage feature's design decision.
+- **No graph-layout library (dagre/elkjs) for the lineage graph** — a
+  small hand-rolled BFS-depth layout is enough for this project's
+  shallow, mostly-linear lineage trees; a real layout algorithm would
+  solve a harder (arbitrary-graph) problem than the one this app
+  actually has.
+- **The lineage graph is a section of the existing dashboard, not a
+  new screen/route** — consistent with the "one main dashboard"
+  decision from the previous feature; it loads automatically after
+  each scenario run rather than requiring a separate navigation step.
 
 ## Known Issues / Deferred Work
 
@@ -1753,8 +1905,15 @@ lands.)
   the "Minimal Judge-Ready Dashboard" feature — a single dashboard
   screen now covers the full demo journey. Still no client-side
   routing (by design — "one main dashboard," not multiple screens); a
-  dedicated lineage-graph visualization and a global audit-trail view
-  remain future work.
+  global audit-trail view remains future work.
+- ~~A dedicated lineage-graph visualization~~ **Resolved** by
+  "Interactive Data Lineage Visualization" — the dashboard now renders
+  the full asset tree with per-node status and a click-for-details
+  panel.
+- The lineage graph's hand-rolled layout doesn't avoid node/edge
+  overlap for a wide branching tree (depth/sibling-order only) — fine
+  for this project's shallow, mostly-linear trees; a genuinely bushy
+  tree would need a real layout library.
 - No literal browser/click-through verification tooling in this
   environment (no Playwright/Puppeteer installed) — the dashboard
   feature's manual verification confirmed the full API request/response
@@ -1801,16 +1960,17 @@ lands.)
   `feat(demo): add deterministic PurposeSeal scenarios`.
 - **Minimal Judge-Ready Dashboard**: recommended commit message
   `feat(ui): add judge-ready PurposeSeal dashboard`.
+- **Interactive Data Lineage Visualization**: recommended commit
+  message `feat(lineage-ui): visualize purpose-bound data provenance`.
 
 ## Next Step
 
 The full PurposeSeal loop (create grant → retrieve → copy/derive →
 evaluate use → detect violation → quarantine) is complete, reachable
-entirely over HTTP, demoable in three single-call scenarios, and now
-has a judge-ready dashboard driving those scenarios with a live
-Summary/Result/Timeline view — see "Minimal Judge-Ready Dashboard"
-above for exact demo steps. Remaining work, in rough priority order:
-a real browser/click-through verification pass once a browser-
-automation tool is available (see Known Issues), a dedicated
-audit-trail view (beyond the per-scenario timeline), and a lineage
-graph visualization for `GET /assets/{id}/lineage`.
+entirely over HTTP, demoable in three single-call scenarios, and has a
+judge-ready dashboard with a live Summary/Result/Timeline/Lineage-graph
+view — see "Judge demo via the dashboard" above for exact demo steps.
+Remaining work, in rough priority order: a real browser/click-through
+verification pass once a browser-automation tool is available (see
+Known Issues), and a dedicated global audit-trail view (beyond the
+per-scenario timeline).
