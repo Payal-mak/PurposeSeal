@@ -645,6 +645,73 @@ reflects the grant's current values.
   assets — only the direct `POST /retrievals` response and DB inspection
   currently expose them.
 
+### Reliability Correction — atomic domain writes and audit events
+
+- **Partial-state risk discovered**: `grant_service.create_grant` and
+  `retrieval_service.retrieve_data` each called `db.commit()` **twice** —
+  once right after creating the business record (`Grant` /
+  retrieved `DataAsset`), and again after writing its success audit
+  event (`GRANT_CREATED` / `DATA_RETRIEVED`). Between those two commits,
+  the business record was already durably persisted. If the second
+  commit — or `write_audit_log` itself — had failed for any reason (a
+  disk error, a constraint violation, the process being killed), the
+  database would be left holding a successfully created grant or
+  retrieved asset with **no audit record showing it happened**. For a
+  system whose core value proposition is an explainable, trustworthy
+  audit trail, a business record that exists without its audit event is
+  exactly the kind of quiet corruption that undermines the whole premise
+  — worse than the operation simply failing outright.
+- **Correction**: both functions now do a single `db.add()` →
+  `db.flush()` (to assign the new row's id, needed for the audit entry's
+  `entity_id`, without committing) → `write_audit_log(...)` →
+  `db.commit()`, wrapped in `try/except Exception: db.rollback(); raise`.
+  The business record and its success audit event are now one atomic
+  transaction: either both are durably persisted, or neither is.
+  `audit_service.write_audit_log` was already correct — it only
+  `db.add()`s and `db.flush()`es, never commits — so transaction
+  ownership already belonged to the caller; no change was needed there,
+  confirming the bug was purely in the two call sites' double-commit
+  pattern, not in the shared helper.
+- **Denied-retrieval attempts were deliberately left unchanged**: those
+  are single, audit-only writes (no paired business record), so there is
+  no atomicity gap to close, per the task's explicit instruction not to
+  touch that path unless correctness required it.
+- **Files modified**: `backend/app/services/grant_service.py`,
+  `backend/app/services/retrieval_service.py` (both: replaced
+  commit-then-commit with flush-then-single-commit, wrapped in
+  try/rollback).
+- **Files added**: `backend/tests/test_atomicity.py`.
+- **Tests added** (4 tests, all against isolated per-test SQLite
+  databases):
+  - `test_successful_grant_creation_is_atomic` — a normal grant creation
+    still produces exactly one `Grant` row and exactly one
+    `GRANT_CREATED` audit event.
+  - `test_grant_creation_rolls_back_if_audit_write_fails` — monkeypatches
+    `grant_service.write_audit_log` to raise, confirms the exception
+    surfaces (Starlette's `ServerErrorMiddleware` re-raises after
+    sending its 500 response, which `TestClient` propagates into the
+    test — itself proof the failure wasn't silently swallowed), and
+    confirms **zero** `Grant` rows and **zero** `GRANT_CREATED` events
+    exist afterward — the flushed-but-uncommitted grant was rolled back.
+  - `test_successful_retrieval_is_atomic` — mirrors the grant test for
+    retrieval: exactly one retrieved `DataAsset` and one `DATA_RETRIEVED`
+    event.
+  - `test_retrieval_rolls_back_if_audit_write_fails` — mirrors the grant
+    failure test: monkeypatches `retrieval_service.write_audit_log` to
+    raise, confirms only the original asset remains (no retrieved copy
+    committed) and zero `DATA_RETRIEVED` events exist.
+  No existing test was weakened or removed to make this pass.
+- **Test result**: `42 passed, 2 warnings in 9.24s` — full suite (4
+  atomicity + 8 domain model + 4 foundation + 17 grants + 9 retrieval),
+  zero regressions.
+- **Known limitations**: this addresses application-level atomicity
+  (both writes inside one SQLAlchemy transaction/commit). It does not
+  add distributed-transaction or two-phase-commit machinery — unnecessary
+  for a single SQLite database where both tables live in the same
+  transaction anyway; the fix is entirely about not committing between
+  the two related writes, not about coordinating across separate
+  databases.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -748,6 +815,12 @@ appended here as each feature lands.)
   audit event, never `DATA_RETRIEVED`** — keeps the audit trail
   unambiguous about what actually succeeded, per the project's
   auditability rule against faking successful entries.
+- **A business record and its success audit event share one commit, not
+  two** — `grant_service.create_grant` and `retrieval_service.retrieve_data`
+  now `flush()` (for the id), write the audit entry, and `commit()` once,
+  wrapped in `try/except: rollback(); raise`. Prevents the exact
+  partial-state risk of a persisted grant/asset with no audit record
+  proving it happened — see the Reliability Correction entry.
 
 ## Known Issues / Deferred Work
 
@@ -797,6 +870,8 @@ appended here as each feature lands.)
   recommended commit message `feat(grants): add purpose-bound access lifecycle`.
 - **Data Retrieval and Purpose Seal Propagation**: recommended commit
   message `feat(retrieval): propagate purpose seal to retrieved data`.
+- **Reliability Correction — atomic domain writes and audit events**:
+  recommended commit message `fix(audit): make domain writes and audit events atomic`.
 
 ## Next Step
 

@@ -81,22 +81,28 @@ def retrieve_data(db: Session, payload: RetrievalCreate) -> DataAsset:
         created_at=now,
     )
     db.add(retrieved)
-    db.commit()
+
+    try:
+        db.flush()  # assign retrieved.id for the audit entry, without committing
+
+        write_audit_log(
+            db,
+            event_type="DATA_RETRIEVED",
+            entity_type="data_asset",
+            entity_id=retrieved.id,
+            details={
+                "grant_id": grant.id,
+                "actor": payload.actor,
+                "operation": payload.operation.value,
+                "root_asset_id": root_id,
+                "purpose": grant.purpose,
+            },
+        )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(retrieved)
-
-    write_audit_log(
-        db,
-        event_type="DATA_RETRIEVED",
-        entity_type="data_asset",
-        entity_id=retrieved.id,
-        details={
-            "grant_id": grant.id,
-            "actor": payload.actor,
-            "operation": payload.operation.value,
-            "root_asset_id": root_id,
-            "purpose": grant.purpose,
-        },
-    )
-    db.commit()
-
     return retrieved

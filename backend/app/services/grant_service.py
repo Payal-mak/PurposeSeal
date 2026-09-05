@@ -29,25 +29,31 @@ def create_grant(db: Session, payload: GrantCreate) -> Grant:
         expires_at=expires_at,
     )
     db.add(grant)
-    db.commit()
+
+    try:
+        db.flush()  # assign grant.id for the audit entry, without committing
+
+        write_audit_log(
+            db,
+            event_type="GRANT_CREATED",
+            entity_type="grant",
+            entity_id=grant.id,
+            details={
+                "subject": grant.subject,
+                "purpose": grant.purpose,
+                "asset_id": grant.asset_id,
+                "allowed_operations": grant.allowed_operations,
+                "created_at": grant.created_at.isoformat(),
+                "expires_at": grant.expires_at.isoformat(),
+            },
+        )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(grant)
-
-    write_audit_log(
-        db,
-        event_type="GRANT_CREATED",
-        entity_type="grant",
-        entity_id=grant.id,
-        details={
-            "subject": grant.subject,
-            "purpose": grant.purpose,
-            "asset_id": grant.asset_id,
-            "allowed_operations": grant.allowed_operations,
-            "created_at": grant.created_at.isoformat(),
-            "expires_at": grant.expires_at.isoformat(),
-        },
-    )
-    db.commit()
-
     return grant
 
 
