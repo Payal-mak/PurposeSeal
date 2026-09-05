@@ -1881,6 +1881,153 @@ POST /retrievals   Authorization: Bearer <researcher_01's token>
   insecure default that must be overridden outside local development
   (documented inline in `core/config.py`).
 
+### Reliability and Idempotency Hardening
+
+**Goal**: a pure reliability pass over the existing MVP — no new product
+functionality — reviewing the checklist of failure modes a judge or a
+careless click could hit (repeated clicks, duplicate requests, DB
+transaction failures, invalid IDs, malformed payloads, expired grants,
+already-quarantined assets, copying quarantined data, duplicate
+scenario execution, backend-unavailable, empty database, inconsistent
+state transitions, race-like duplicates) and fixing what materially
+needed it.
+
+**What was already safe** (reviewed, confirmed correct, left
+unchanged):
+- *Repeated button clicks* — `ScenarioControls`/`Dashboard.jsx` already
+  disable all scenario buttons for the duration of a run and re-enable
+  them afterward (`runningKey` state), with dedicated frontend tests.
+- *Backend unavailable / frontend refresh* — `lib/api.js`'s `request()`
+  already catches a failed `fetch` itself (network error, not just a
+  non-2xx response) and surfaces "Could not reach the PurposeSeal
+  backend," tested in `Dashboard.test.jsx`. A refresh just re-fetches
+  from the backend; no client-only state needs to survive it.
+- *Empty database* — every list endpoint already returns `[]` cleanly;
+  `SummaryMetrics` already renders `0`/`—`, not `NaN` or a crash.
+- *Database transaction failures* — every service that writes a domain
+  row plus its audit event already does so as `flush → write_audit_log
+  → commit`, with `except Exception: db.rollback(); raise` around it
+  (added in the earlier "Reliability Correction" feature). The generic
+  `Exception` handler in `core/errors.py` already returns a clean
+  `{"error_code": "internal_error", ...}` 500 without a stack trace —
+  confirmed with a new test that exercises it the way a real deployed
+  server (not TestClient's debug-friendly re-raise default) actually
+  would.
+- *Expired grants, already-quarantined re-use, duplicate revoke* — all
+  already handled and already tested (`evaluate_grant_status`,
+  `_deny`'s `existing_remediation` branch, `revoke_grant`'s
+  early-return-if-already-REVOKED). Pinned with one more regression
+  test each in `test_reliability_hardening.py` for visibility alongside
+  the newly-found issues, not because they were broken.
+- *Duplicate scenario execution* — each `/demo/scenarios/*` call
+  creates a brand-new asset/grant/copy chain with fresh autoincrement
+  ids by design (see the Deterministic Demo Scenario Engine feature);
+  there's nothing to collide on. Confirmed with a test that runs the
+  same scenario twice in a row.
+
+**Issues found and fixed**:
+1. **Quarantined data could still be copied/derived.**
+   `copy_service.create_copy` checked the origin grant's subject,
+   status, and allowed operations, but never the *parent asset's own
+   state*. A grant that produced a since-quarantined asset can remain
+   `ACTIVE` (a `PURPOSE_MISMATCH` violation doesn't touch the grant's
+   status, only the asset's) — so `POST /copies` against that
+   quarantined asset would succeed as long as the grant still looked
+   valid, silently laundering quarantined data into a fresh, ACTIVE
+   copy. **Fixed**: `create_copy` now checks `parent.state ==
+   AssetState.QUARANTINED` first and denies with `403
+   parent_quarantined`, recorded as a `COPY_CREATION_DENIED` audit
+   event exactly like every other copy denial reason.
+2. **A quarantined asset could be "retrieved" again under a fresh
+   grant.** `POST /grants` doesn't require its `asset_id` to be a root
+   asset — a grant can be issued directly against any existing
+   `DataAsset`, including one already quarantined for a purpose
+   violation. `retrieval_service.retrieve_data` never checked the
+   target asset's own state, only the grant's. **Fixed**: it now
+   checks `root_asset.state == AssetState.QUARANTINED` and denies with
+   `403 asset_quarantined`, recorded as `DATA_RETRIEVAL_DENIED`. This
+   closes the same class of bug as #1 from the other direction.
+3. **Inconsistent, internals-leaking error contract on malformed
+   payloads.** Every hand-written error in this API already returns
+   `{"error_code", "message"}` — but FastAPI's built-in handling of
+   invalid request bodies, unknown-but-forbidden fields, and
+   wrong-typed path parameters (e.g. `GET /grants/not-a-number`)
+   returned its own default shape, `{"detail": [{"loc": [...], "msg":
+   ..., "type": ...}]}`, exposing pydantic's internal error structure
+   and giving the frontend a second shape to special-case. **Fixed**:
+   registered a `RequestValidationError` handler in `core/errors.py`
+   that normalizes the first error into the same `{"error_code":
+   "validation_error", "message": "<field>: <reason>"}` contract as
+   everything else.
+4. **Inconsistent payload strictness across create endpoints.**
+   `CopyCreate`, `UseCreate`, and `DataAssetCreate` all set
+   `extra="forbid"` (a stray/misspelled field is rejected outright, not
+   silently dropped) — `GrantCreate` and `RetrievalCreate` didn't.
+   **Fixed**: added `extra="forbid"` to both for consistency; a
+   malformed payload with an unexpected field on any create endpoint
+   now gets the same `422 validation_error` response.
+5. **Duplicate-username registration wasn't race-safe.**
+   `auth_service.register_user` checked "is this username taken" and
+   then inserted in two separate steps — not atomic. Two
+   near-simultaneous registrations for the same username could both
+   pass the check before either commits, and the second `db.commit()`
+   would then raise a raw, unhandled `IntegrityError` (the `users`
+   table's real `unique=True` constraint on `username`), surfacing as
+   an unfriendly `500 internal_error` instead of the `409
+   username_taken` a sequential duplicate gets. **Fixed**: the insert
+   is now wrapped in `try: db.commit() except IntegrityError:
+   db.rollback(); raise ConflictError(..., error_code="username_taken")`
+   — the database's own constraint becomes the real safety net, and
+   either way in produces the same clean 409. (No distributed locking
+   added — SQLite plus this one `try/except` is the appropriately
+   minimal fix per the review's own "don't overengineer" instruction.)
+
+**Files changed**:
+- `backend/app/services/copy_service.py` — parent-quarantine check (fix
+  #1).
+- `backend/app/services/retrieval_service.py` — target-asset-quarantine
+  check (fix #2).
+- `backend/app/core/errors.py` — `RequestValidationError` handler +
+  `_format_validation_message` helper (fix #3).
+- `backend/app/schemas/grant.py`, `backend/app/schemas/retrieval.py` —
+  added `extra="forbid"` (fix #4).
+- `backend/app/services/auth_service.py` — extracted `_username_taken`
+  helper (also makes the race window mockable in tests) and wrapped the
+  insert in a `try/except IntegrityError` (fix #5).
+- `backend/tests/test_reliability_hardening.py` — new file, 12
+  regression tests: one or two per fix above, plus pinning tests for
+  the "already safe" behaviors reviewed alongside them.
+
+**Tests**: `backend/tests/test_reliability_hardening.py` (12 new
+tests). Full backend suite: **147 passed** (135 prior + 12 new — no
+regressions). Full frontend suite: **21 passed**, unchanged (no
+frontend code touched — this pass was backend-only; the frontend's own
+reliability behaviors were reviewed and found already correct, see
+above).
+
+**Manual verification**: ran an isolated `uvicorn` instance (port
+8184, its own SQLite file) and confirmed live over `curl`: a negative
+`duration_minutes` on `POST /grants` now returns `{"error_code":
+"validation_error", "message": "duration_minutes: Input should be
+greater than 0"}`; `GET /grants/not-an-integer` returns the same
+contract shape (`"grant_id: Input should be a valid integer..."`); and
+the full copy-of-quarantined-data attack — create asset → grant →
+retrieve → violate purpose (asset quarantines, grant stays ACTIVE) →
+attempt `POST /copies` against the quarantined asset — now returns
+`403 {"error_code": "parent_quarantined", ...}` instead of succeeding.
+Verification server and database file were cleaned up afterward.
+
+**Known limitations**: no distributed locking or `SELECT ... FOR
+UPDATE`-style row locking was added anywhere (explicitly out of scope
+per the review's own instruction not to overengineer this for SQLite);
+the register-race fix relies on the database's `UNIQUE` constraint as
+the actual source of truth, which is sufficient for SQLite's
+single-writer model but wouldn't need this except clause at all under
+a database with a different isolation model. The validation-error
+normalizer surfaces only the *first* pydantic error when a payload has
+multiple problems at once — acceptable for a hackathon MVP's error
+messaging, not a full multi-field error report.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -1898,8 +2045,8 @@ POST /retrievals   Authorization: Bearer <researcher_01's token>
 | GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
 | GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
 | POST | /grants/{id}/revoke | **Requires authentication + `COMPLIANCE_OFFICER`/`ADMIN` role.** Explicitly revoke a grant (persists `status: REVOKED` + `GRANT_REVOKED` audit event); idempotent — repeat calls return the already-revoked grant without a duplicate event |
-| POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code`. If a valid Bearer token is present, `actor` is taken from it, not the body |
-| POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant. Same Bearer-token `actor` override as `/retrievals` |
+| POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` (including `403 asset_quarantined` if the target asset is already quarantined). If a valid Bearer token is present, `actor` is taken from it, not the body |
+| POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant, and denies `403 parent_quarantined` if the parent asset is already quarantined. Same Bearer-token `actor` override as `/retrievals` |
 | POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at, remediation, remediation_status}` — the last two are populated only for a purpose-lifecycle violation. Same Bearer-token `actor` override as `/retrievals` — note this never changes the decision logic itself, only whose identity it's evaluated against |
 | GET | /dev/clock | **Simulation only** — current simulated time |
 | POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
@@ -2290,6 +2437,28 @@ lands.)
   endpoints, `subject` represents who a grant is issued *to*, which
   can legitimately differ from who's creating it; overriding it would
   break "issue a grant to someone else" as a use case.
+- **Quarantine is checked on the asset itself, at the point of
+  copy/retrieval, not inferred from the grant** — `copy_service` and
+  `retrieval_service` now both check `state == AssetState.QUARANTINED`
+  directly on the asset being acted on, rather than trying to infer
+  "this asset must be tainted" from its origin grant's status. The two
+  facts (grant status, asset quarantine state) can legitimately diverge
+  — a `PURPOSE_MISMATCH` violation quarantines the asset without ever
+  touching the grant — so only checking the asset itself is correct;
+  checking the grant instead would have missed exactly this case. See
+  the Reliability and Idempotency Hardening feature.
+- **A single `RequestValidationError` handler normalizes every
+  malformed-payload/invalid-path-parameter response, instead of each
+  schema handling its own validation errors** — one handler in
+  `core/errors.py`, registered once in `register_exception_handlers`,
+  covers every endpoint's body/query/path validation uniformly; no
+  per-router special-casing needed.
+- **The database's own `UNIQUE` constraint is the actual race-safety
+  mechanism for duplicate usernames, not application-level locking** —
+  a `try/except IntegrityError` around the insert is the minimal fix
+  that closes the TOCTOU gap between the pre-check and the commit,
+  consistent with the hardening review's explicit instruction not to
+  overengineer distributed locking for SQLite.
 
 ## Known Issues / Deferred Work
 
@@ -2359,6 +2528,16 @@ lands.)
   (session-local counter, by design); "Active Grants," "Tracked
   Copies," and "Quarantined Assets" are always live from the backend
   and persist across reloads.
+- No distributed/row-level locking anywhere (deliberate — SQLite plus
+  the existing flush-then-commit atomicity pattern is the appropriately
+  minimal approach at this scale, per the Reliability and Idempotency
+  Hardening feature's own scope). The one place a real race was fixed
+  (duplicate username registration) relies on the database's `UNIQUE`
+  constraint as the actual safety net, not application-level locking.
+- The validation-error normalizer (`RequestValidationError` handler in
+  `core/errors.py`) surfaces only the first pydantic error when a
+  payload has multiple problems at once — fine for a hackathon MVP, not
+  a full multi-field error report.
 
 ## Git History
 
@@ -2400,6 +2579,8 @@ lands.)
   `feat(remediation): persist violation response workflow`.
 - **Actor Roles and Minimal Authentication**: recommended commit
   message `feat(auth): add role-aware actor authentication`.
+- **Reliability and Idempotency Hardening**: recommended commit message
+  `fix(core): harden lifecycle and error handling`.
 
 ## Next Step
 
@@ -2417,4 +2598,7 @@ browser-automation tool is available (see Known Issues), a dedicated
 global audit-trail view (beyond the per-scenario timeline), a
 resolve/dismiss workflow for an open `Remediation` if ever requested,
 and — if the auth surface needs to be judge-visible, not just
-API-visible — a login screen in the dashboard.
+API-visible — a login screen in the dashboard. A reliability/idempotency
+hardening pass has since closed the copy/retrieve-quarantined-data gap
+and made the error contract fully consistent (see "Reliability and
+Idempotency Hardening" above) — no product functionality changed.

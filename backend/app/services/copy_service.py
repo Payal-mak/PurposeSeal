@@ -50,6 +50,15 @@ def create_copy(db: Session, payload: CopyCreate) -> DataAsset:
     """
     parent = asset_service.get_asset(db, payload.parent_asset_id)
 
+    if parent.state == AssetState.QUARANTINED:
+        _record_denied_attempt(
+            db, entity_type="data_asset", entity_id=parent.id, payload=payload, reason_code="parent_quarantined"
+        )
+        raise ForbiddenError(
+            "Cannot create a copy or derivative of an asset that is currently quarantined.",
+            error_code="parent_quarantined",
+        )
+
     if parent.origin_grant_id is None:
         _record_denied_attempt(
             db,

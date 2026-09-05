@@ -67,6 +67,14 @@ def retrieve_data(db: Session, payload: RetrievalCreate) -> DataAsset:
         )
 
     root_asset = db.get(DataAsset, grant.asset_id)
+
+    if root_asset.state == AssetState.QUARANTINED:
+        _record_denied_attempt(db, grant, payload, reason_code="asset_quarantined")
+        raise ForbiddenError(
+            "This asset is currently quarantined and cannot be retrieved.",
+            error_code="asset_quarantined",
+        )
+
     now = clock.now()
     root_id = root_asset.root_asset_id or root_asset.id
 

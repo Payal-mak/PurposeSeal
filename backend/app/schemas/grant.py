@@ -7,6 +7,8 @@ from ..models.grant import GrantStatus
 
 
 class GrantCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     subject: str = Field(..., min_length=1, description="Who the grant is issued to (the actor)")
     purpose: str = Field(..., min_length=1, description="The bounded purpose justifying access")
     asset_id: int = Field(..., gt=0, description="ID of the existing protected DataAsset this grant authorizes")

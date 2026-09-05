@@ -1,3 +1,4 @@
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..core.clock import clock
@@ -7,6 +8,10 @@ from ..models.user import User
 from ..schemas.auth import UserRegister
 
 
+def _username_taken(db: Session, username: str) -> bool:
+    return db.query(User).filter(User.username == username).first() is not None
+
+
 def register_user(db: Session, payload: UserRegister) -> User:
     """Creates a new login identity. Open to anyone for any role
     (including ADMIN/COMPLIANCE_OFFICER) -- a real deployment would
@@ -14,8 +19,7 @@ def register_user(db: Session, payload: UserRegister) -> User:
     deliberate hackathon-scope simplification, documented in
     docs/PROJECT_PROGRESS.md.
     """
-    existing = db.query(User).filter(User.username == payload.username).first()
-    if existing is not None:
+    if _username_taken(db, payload.username):
         raise ConflictError(f"Username '{payload.username}' is already taken.", error_code="username_taken")
 
     password_hash, salt = hash_password(payload.password)
@@ -27,7 +31,20 @@ def register_user(db: Session, payload: UserRegister) -> User:
         created_at=clock.now(),
     )
     db.add(user)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # The pre-check above and this insert aren't atomic -- two
+        # near-simultaneous registrations for the same username can both
+        # pass the check before either commits. Rather than a raw,
+        # unhandled IntegrityError surfacing as a 500, the database's own
+        # unique constraint on `username` is the real safety net here,
+        # and its failure is translated back to the same 409 a
+        # sequential duplicate would get.
+        db.rollback()
+        raise ConflictError(f"Username '{payload.username}' is already taken.", error_code="username_taken") from None
+
     db.refresh(user)
     return user
 
