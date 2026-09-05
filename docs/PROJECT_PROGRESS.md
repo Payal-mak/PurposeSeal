@@ -1153,6 +1153,108 @@ GET /assets/1  -> "state": "ACTIVE"   (root asset untouched)
   aren't distinguished because nothing yet needs an asset with a parent
   but no origin grant.
 
+### Deterministic Demo Scenario Engine
+
+**Goal**: let a judge (or the frontend) trigger the complete PurposeSeal
+journey — legitimate use, purpose expiry, purpose mismatch — with a
+single API call each, with zero manual grant/retrieval setup and zero
+randomness, so the demo is 100% reproducible.
+
+- **`backend/app/services/demo_service.py`** — three scenario functions
+  (`run_legitimate_scenario`, `run_expired_scenario`,
+  `run_purpose_mismatch_scenario`), each calling the *existing*
+  `asset_service` / `grant_service` / `retrieval_service` /
+  `copy_service` / `policy_service` functions in sequence — there is no
+  separate "demo" business logic path, only canned actors/purposes/
+  durations (`researcher_01`, `clinical_trial_screening`,
+  `marketing_analytics`) standing in for what a human would otherwise
+  type in by hand. Time advancement (the expired scenario) uses
+  `clock.advance()` directly, the same simulated-clock abstraction
+  `/dev/clock/advance` exposes — no `time.sleep`, no real waiting.
+- **Full timeline reconstruction**: `_collect_timeline()` queries
+  `AuditLog` for every event touching the scenario's asset(s)/grant,
+  ordered by primary key (insertion order) rather than `created_at` —
+  several writes in the same scenario can share the exact same
+  simulated instant (e.g. everything before a `clock.advance()` call),
+  so timestamp ordering alone isn't reliable, but commit order always
+  is.
+- **No collisions across runs, by construction, not by cleanup**: every
+  scenario calls `asset_service.create_asset`/`grant_service.create_grant`
+  fresh each time, so every run gets brand-new autoincrement ids. There
+  is no shared "the demo asset" row to collide on, reset, or leak state
+  between runs — each response is entirely self-contained (its own
+  asset/grant ids and its own timeline).
+- **Remediation field**: `expired` and `purpose-mismatch` responses
+  include a `remediation` string (plain-language next step, e.g. "issue
+  a new purpose grant for X if legitimate"); `legitimate` returns
+  `remediation: null` since nothing needs correcting.
+- **New schemas**: `backend/app/schemas/demo.py` —
+  `TimelineEventOut` (`event_type`, `entity_type`, `entity_id`,
+  `details`, `created_at`) and `DemoScenarioOut` (`scenario`, `decision`,
+  `reason_code`, `reason`, `asset_id`, `grant_id`, `remediation`,
+  `timeline`).
+- **New router**: `backend/app/api/demo.py`, prefix `/demo/scenarios`,
+  registered only when `settings.enable_dev_endpoints` is true — the
+  same gate as `/dev/clock*`, since this is demo scaffolding, not
+  product functionality a real deployment should expose.
+
+**Worked example (from a live server, three separate scenario calls)**:
+```
+POST /demo/scenarios/legitimate
+-> {"decision": "ALLOW", "reason_code": "WITHIN_PURPOSE_AND_VALIDITY",
+    "remediation": null,
+    "timeline": [SOURCE_ASSET_CREATED, GRANT_CREATED, DATA_RETRIEVED,
+                 COPY_CREATED, DATA_USE_ATTEMPTED, USE_ALLOWED]}
+
+POST /demo/scenarios/expired
+-> {"decision": "DENY", "reason_code": "PURPOSE_EXPIRED",
+    "remediation": "Issue a new purpose grant against the original asset...",
+    "timeline": [SOURCE_ASSET_CREATED, GRANT_CREATED, DATA_RETRIEVED,
+                 DERIVED_ASSET_CREATED, DATA_USE_ATTEMPTED,
+                 PURPOSE_VIOLATION, ASSET_QUARANTINED]}
+
+POST /demo/scenarios/purpose-mismatch
+-> {"decision": "DENY", "reason_code": "PURPOSE_MISMATCH",
+    "remediation": "If 'marketing_analytics' is a legitimate use case...",
+    "timeline": [SOURCE_ASSET_CREATED, GRANT_CREATED, DATA_RETRIEVED,
+                 DATA_USE_ATTEMPTED, PURPOSE_VIOLATION, ASSET_QUARANTINED]}
+
+Rerunning /demo/scenarios/legitimate immediately afterward returned a
+brand-new asset_id (11 vs. 3 the first time) with the same ALLOW
+decision -- confirming no collision and full determinism.
+```
+
+- **Files added**: `backend/app/services/demo_service.py`,
+  `backend/app/schemas/demo.py`, `backend/app/api/demo.py`,
+  `backend/tests/test_demo_scenarios.py`.
+- **Files modified**: `backend/app/api/__init__.py` (registers
+  `demo_router` alongside `dev_router`), `backend/app/schemas/__init__.py`.
+- **Endpoints added**: `POST /demo/scenarios/legitimate`,
+  `POST /demo/scenarios/expired`, `POST /demo/scenarios/purpose-mismatch`.
+- **Tests added** (10 tests in `test_demo_scenarios.py`): legitimate
+  scenario returns `ALLOW`; expired scenario returns `DENY`; mismatch
+  scenario returns `DENY`; exact expected audit-event sequence for each
+  of the three scenarios (list equality, not just "contains"); expected
+  asset state after each scenario (`ACTIVE` for legitimate,
+  `QUARANTINED` for the other two); scenarios can be rerun safely with
+  no id collision; all three scenarios produce identical decisions and
+  reason codes across repeated runs (determinism); `time.sleep` is
+  proven never called (via `monkeypatch`, not just an elapsed-time
+  guess) across all three scenarios; every timeline event carries a
+  timestamp and a valid `entity_type`.
+- **Test result**: `112 passed, 2 warnings in 18.56s` — full suite (102
+  prior + 10 new), zero regressions. Also manually verified all three
+  scenarios end-to-end against a live `uvicorn` process, including a
+  rerun collision check — see the worked example above.
+- **Known limitations**: the three scenarios are fixed (not
+  parameterizable — actor/purpose/durations are hard-coded), matching
+  the "do not overengineer" instruction; a frontend wanting a different
+  actor or purpose for its own demo would need a new scenario function,
+  not a request parameter. Demo data accumulates in the database across
+  repeated runs (each run's rows are never deleted) — acceptable for a
+  hackathon demo session, but a long-running demo server would
+  eventually want a way to reset/clear it.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -1172,12 +1274,58 @@ GET /assets/1  -> "state": "ACTIVE"   (root asset untouched)
 | POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at}` |
 | GET | /dev/clock | **Simulation only** — current simulated time |
 | POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
+| POST | /demo/scenarios/legitimate | **Simulation only** — runs the full legitimate-use journey in one call; returns the decision (`ALLOW`) and its complete audit timeline |
+| POST | /demo/scenarios/expired | **Simulation only** — runs the full purpose-expiry journey in one call (advances simulated time itself); returns `DENY`/`PURPOSE_EXPIRED`, the quarantined asset id, and the full timeline |
+| POST | /demo/scenarios/purpose-mismatch | **Simulation only** — runs the full purpose-mismatch journey in one call; returns `DENY`/`PURPOSE_MISMATCH`, remediation guidance, and the full timeline |
 
 The entire lifecycle — original asset → grant → retrieval → copy/derived
 asset → use evaluation → revocation — is now reachable entirely through
 these APIs; nothing requires direct ORM/SQLite seeding anymore.
 
 ## Demo Journey
+
+### One-call deterministic scenarios (recommended)
+
+The fastest way to show the whole product — no manual grant/retrieval
+setup required. Each endpoint drives a complete, self-contained journey
+server-side using canned actors/purposes and the simulated clock, then
+returns the final decision plus its full audit timeline in one response.
+No randomness, no network calls, no waiting. Safe to call repeatedly —
+every call creates a brand-new asset/grant/copy chain (fresh
+autoincrement ids), so runs never collide with each other:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/demo/scenarios/legitimate" -Method Post
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/demo/scenarios/expired" -Method Post
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/demo/scenarios/purpose-mismatch" -Method Post
+```
+
+- **`POST /demo/scenarios/legitimate`** — creates an asset, grant,
+  retrieval, and a copy, then uses the copy for its original purpose
+  before expiry. Returns `{"decision": "ALLOW", "reason_code":
+  "WITHIN_PURPOSE_AND_VALIDITY", ...}` with a 6-event timeline
+  (`SOURCE_ASSET_CREATED` → `GRANT_CREATED` → `DATA_RETRIEVED` →
+  `COPY_CREATED` → `DATA_USE_ATTEMPTED` → `USE_ALLOWED`).
+- **`POST /demo/scenarios/expired`** — creates a 10-minute grant,
+  retrieves, derives a copy, advances the simulated clock 11 minutes
+  (`clock.advance()`, no real waiting), then attempts reuse. Returns
+  `{"decision": "DENY", "reason_code": "PURPOSE_EXPIRED", ...}` plus
+  remediation guidance; the derived copy is quarantined
+  (`PURPOSE_VIOLATION` → `ASSET_QUARANTINED` at the end of its
+  7-event timeline).
+- **`POST /demo/scenarios/purpose-mismatch`** — creates an asset, grant,
+  and retrieval for `clinical_trial_screening`, then attempts use for
+  `marketing_analytics`. Returns `{"decision": "DENY", "reason_code":
+  "PURPOSE_MISMATCH", ...}` plus remediation guidance; the retrieved
+  copy is quarantined (6-event timeline).
+
+Each response's `timeline` array is a chronological (insertion-order)
+list of every audit event touching that scenario's asset(s) and grant —
+`{event_type, entity_type, entity_id, details, created_at}` per event —
+ready to render as a judge-facing activity feed without any additional
+querying.
+
+### Manual step-by-step journey
 
 1. Open the frontend shell — product name, layout, and a live "Backend
    connected" indicator confirm the stack is wired end-to-end.
@@ -1349,6 +1497,21 @@ lands.)
   this feature existed. `grant_service.revoke_grant` only had to make
   `REVOKED` reachable through the API; duplicating that check inside the
   revoke endpoint would have created two places that could disagree.
+- **Demo scenarios call existing services directly, not their own HTTP
+  endpoints internally** — `demo_service.py` imports and calls
+  `asset_service`/`grant_service`/etc. functions the same way
+  `api/assets.py` or `api/grants.py` do, rather than the scenario
+  endpoint making internal HTTP requests to `/assets`, `/grants`, etc.
+  Same transactional session, same atomic behavior, no self-networking.
+- **Timeline ordering is by `AuditLog.id`, not `created_at`** — the
+  expired scenario deliberately advances the simulated clock, and
+  several events on either side of that jump can otherwise share
+  indistinguishable timestamps; primary-key insertion order is the only
+  sequence guaranteed to match what actually happened.
+- **Demo scenarios are registered under `enable_dev_endpoints`, the same
+  flag as `/dev/clock*`** — they are equally "not real product
+  functionality," just canned data generators for showing the product,
+  so they get the same production off-switch.
 
 ## Known Issues / Deferred Work
 
@@ -1370,6 +1533,9 @@ lands.)
   `Base.metadata.create_all`, which only adds missing tables, never alters
   existing ones. Fine for a hackathon MVP (the local dev db can just be
   deleted and recreated), but worth naming as a real limitation.
+- Demo scenarios are fixed, not parameterizable, and leave their
+  generated rows in the database permanently (no cleanup/reset
+  endpoint) — acceptable for a hackathon demo session.
 
 ## Git History
 
@@ -1401,12 +1567,15 @@ lands.)
 - **Operational APIs — Source Asset Management and Grant Revocation**:
   recommended commit message
   `feat(assets): add source asset creation and grant revocation`.
+- **Deterministic Demo Scenario Engine**: recommended commit message
+  `feat(demo): add deterministic PurposeSeal scenarios`.
 
 ## Next Step
 
 With the core loop complete (create grant → retrieve → copy/derive →
-evaluate use → detect violation → quarantine) and now fully reachable
-over HTTP (create original asset → revoke a grant), remaining work is
-the minimal usable frontend walking a judge through the whole journey
-end-to-end, and — later — an audit timeline view, per the hackathon
-priority list.
+evaluate use → detect violation → quarantine), fully reachable over HTTP
+(create original asset → revoke a grant), and now demoable in three
+single-call scenarios with full timelines, remaining work is the
+minimal usable frontend walking a judge through the whole journey
+end-to-end (ideally driven by the three `/demo/scenarios/*` endpoints
+plus a timeline/activity view), per the hackathon priority list.

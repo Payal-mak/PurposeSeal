@@ -1,5 +1,6 @@
 from .copy import CopyCreate
 from .data_asset import DataAssetCreate, DataAssetOut
+from .demo import DemoScenarioOut, TimelineEventOut
 from .dev import ClockAdvanceRequest, ClockStateOut
 from .grant import GrantCreate, GrantOut, GrantStatusOut
 from .lineage import LineageEdge, LineageOut
@@ -21,4 +22,6 @@ __all__ = [
     "PolicyDecisionOut",
     "ClockAdvanceRequest",
     "ClockStateOut",
+    "DemoScenarioOut",
+    "TimelineEventOut",
 ]
