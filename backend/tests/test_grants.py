@@ -92,6 +92,49 @@ def test_create_grant_negative_duration_returns_422(client):
     assert resp.status_code == 422
 
 
+def test_create_grant_defaults_allowed_operations_to_all_four(client):
+    resp = client.post(
+        "/grants",
+        json={
+            "subject": "analyst_1",
+            "purpose": "fraud_investigation",
+            "resource_id": "r1",
+            "duration_minutes": 30,
+        },
+    )
+    assert resp.status_code == 201
+    assert sorted(resp.json()["allowed_operations"]) == ["ANALYZE", "COPY", "EXPORT", "VIEW"]
+
+
+def test_create_grant_with_explicit_allowed_operations(client):
+    resp = client.post(
+        "/grants",
+        json={
+            "subject": "analyst_1",
+            "purpose": "fraud_investigation",
+            "resource_id": "r1",
+            "duration_minutes": 30,
+            "allowed_operations": ["VIEW", "ANALYZE"],
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["allowed_operations"] == ["VIEW", "ANALYZE"]
+
+
+def test_create_grant_with_invalid_allowed_operation_returns_422(client):
+    resp = client.post(
+        "/grants",
+        json={
+            "subject": "analyst_1",
+            "purpose": "fraud_investigation",
+            "resource_id": "r1",
+            "duration_minutes": 30,
+            "allowed_operations": ["DELETE"],
+        },
+    )
+    assert resp.status_code == 422
+
+
 def test_grant_creation_writes_single_audit_log_entry(client, db_engine):
     resp = client.post(
         "/grants",

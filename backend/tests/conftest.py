@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.clock import clock  # noqa: E402
 from app.db.base import Base  # noqa: E402
-from app.db.session import get_db  # noqa: E402
+from app.db.session import enable_sqlite_foreign_keys, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -18,9 +18,22 @@ from app.main import app  # noqa: E402
 def db_engine(tmp_path):
     db_path = tmp_path / "test.db"
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    enable_sqlite_foreign_keys(engine)
     Base.metadata.create_all(bind=engine)
     yield engine
     engine.dispose()
+
+
+@pytest.fixture()
+def db_session(db_engine):
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)
+    session = session_local()
+    clock.reset()
+    try:
+        yield session
+    finally:
+        session.close()
+        clock.reset()
 
 
 @pytest.fixture()

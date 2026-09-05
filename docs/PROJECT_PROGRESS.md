@@ -18,7 +18,8 @@ at the access-grant level.
     business logic or direct DB queries.
   - `services/` — business logic (e.g. `grant_service.create_grant`,
     `audit_service.write_audit_log`), takes a DB session, returns models.
-  - `models/` — SQLAlchemy ORM models (`Grant`, `AuditLog`).
+  - `models/` — SQLAlchemy ORM models (`Grant`, `DataAsset`, `AuditLog`,
+    plus shared enums `AllowedOperation`, `AssetState`, `GrantStatus`).
   - `schemas/` — Pydantic request/response schemas.
   - `db/` — `base.py` (declarative `Base`) and `session.py` (engine,
     `SessionLocal`, `get_db`, `init_db`).
@@ -52,19 +53,79 @@ at the access-grant level.
 
 ## Database Model
 
-- **Grant** (`grants` table)
-  - `id`, `subject` (who holds the grant), `purpose` (free-text bounded
-    purpose), `resource_id` (identifier of the sensitive resource/dataset),
-    `status` (`ACTIVE` / `EXPIRED` / `REVOKED`), `created_at`, `expires_at`
-    (both UTC datetimes).
-- **AuditLog** (`audit_logs` table)
+- **Grant** (`grants` table) — PurposeSeal's "PurposeGrant": why an actor
+  may use a resource, for how long, and for which operations.
+  - `id`, `subject` (actor identity — a stable string, no auth system yet),
+    `purpose` (free-text bounded purpose), `resource_id` (string identifier
+    of the resource/dataset category this grant authorizes — **not** a
+    foreign key; see "Grant ↔ DataAsset relationship" below),
+    `allowed_operations` (JSON array of `AllowedOperation` values —
+    `VIEW`/`ANALYZE`/`COPY`/`EXPORT` — defaults to all four if not given),
+    `status` (`ACTIVE` / `EXPIRED` / `REVOKED`), `created_at` (issued time),
+    `expires_at` (both UTC datetimes).
+- **DataAsset** (`data_assets` table) — an original or derived piece of
+  sensitive data.
+  - `id`, `name`, `asset_type`, `parent_asset_id` (self-FK, nullable — the
+    direct predecessor; `None` for an original/root asset),
+    `root_asset_id` (self-FK, nullable — denormalized pointer straight at
+    the top-level ancestor so lineage checks don't need to walk the parent
+    chain; `None` means *this row is the root*, so the effective root id
+    is always `root_asset_id or id`), `origin_grant_id` (FK to
+    `grants.id`, **not nullable** — denormalized onto every asset, root
+    and copies alike, so "which purpose justified this data" is a single-
+    column lookup), `state` (`ACTIVE` / `QUARANTINED`), `fingerprint`
+    (nullable string), `created_at` (UTC).
+- **AuditLog** (`audit_logs` table) — PurposeSeal's "AuditEvent": a
+  persistent chronological record of domain activity.
   - `id`, `event_type` (e.g. `GRANT_CREATED`), `entity_type` (e.g.
-    `"grant"`), `entity_id`, `details` (JSON-encoded string), `created_at`.
+    `"grant"`, `"data_asset"`), `entity_id`, `details` (JSON-encoded
+    string), `created_at`. Deliberately references entities by
+    `entity_type` + `entity_id` string rather than a real foreign key,
+    since it must be able to log against any current or future entity
+    without a schema change.
 
-No relationships between them yet at the ORM level (audit entries reference
-entities by `entity_type` + `entity_id` string, not a foreign key) — kept
-loose deliberately since future entities (retrieved data, copies) will also
-need to write into the same audit log.
+### Relationships
+
+- `DataAsset.origin_grant_id` → `Grant.id` (many assets per grant).
+- `DataAsset.parent_asset_id` → `DataAsset.id` (self-referential, one
+  level of lineage per row).
+- `DataAsset.root_asset_id` → `DataAsset.id` (self-referential,
+  denormalized shortcut to the root).
+- SQLite does not enforce foreign keys by default; `db/session.py` turns
+  `PRAGMA foreign_keys=ON` on for every connection (production and test
+  engines alike) so an invalid reference actually raises `IntegrityError`
+  instead of silently succeeding.
+
+### Grant ↔ DataAsset relationship — design decision
+
+PurposeGrant's "protected/root asset" concept is **not** a foreign key on
+`Grant`. Reasoning: per the hackathon demo flow, a grant is created
+*before* any data has been retrieved (step 1), and a `DataAsset` row only
+comes into existence when that data is actually retrieved (step 2, a
+future feature) — at grant-creation time there is nothing yet for
+`Grant` to point to. So the relationship runs the other way: `Grant`
+keeps its free-text `resource_id` (which resource/category it
+authorizes), and each `DataAsset` created under it stores
+`origin_grant_id` pointing back to the grant. This also means **no
+change was needed to the existing `POST /grants` endpoint's contract**
+for `resource_id` — only an additive, optional `allowed_operations`
+field was introduced.
+
+### Usage/policy decision entity — design decision
+
+No dedicated `UsageDecision` table was added this step. Reasoning: no
+evaluation logic exists yet (that is the "detect purpose expiry" /
+"evaluate reuse" feature, still ahead per the priority list), and
+building the table before the real decision shape is known from that
+logic risks getting it wrong and rewriting it. `AuditLog` is already
+generic enough (`event_type` + `entity_type` + `entity_id` + JSON
+`details`) to record `USE_ALLOWED` / `PURPOSE_VIOLATION` events for now.
+When the policy engine lands, its required output shape (`decision`,
+`reason_code`, `human_readable_reason`, `grant_id`, `asset_id`,
+`evaluated_at` — per the project's policy engine rules) will very likely
+justify a dedicated, queryable `UsageDecision` table so judges can filter
+decisions by grant/asset; that table is deferred to that feature, not
+built speculatively now.
 
 ## Implemented Features
 
@@ -188,12 +249,79 @@ need to write into the same audit log.
   `.env.example` committed yet since no secrets/config are required to run
   locally.
 
+### Core Domain Model — DataAsset, enums, and FK-safe persistence
+
+- **What was implemented**:
+  - `DataAsset` model (`data_assets` table) with self-referential
+    `parent_asset_id`/`root_asset_id` and a denormalized `origin_grant_id`
+    FK to `Grant` — see Database Model above for the full field list and
+    the reasoning for how it relates to `Grant`.
+  - `AllowedOperation` (`VIEW`/`ANALYZE`/`COPY`/`EXPORT`) and `AssetState`
+    (`ACTIVE`/`QUARANTINED`) enums added under `app/models/`; `Grant`
+    gained an `allowed_operations` JSON column (defaults to all four
+    operations when not supplied).
+  - `DataAssetOut` Pydantic schema added for future serialization; no new
+    HTTP endpoints were added for `DataAsset` (per explicit scope — only
+    enough was built to test persistence).
+  - SQLite foreign-key enforcement turned on (`PRAGMA foreign_keys=ON`)
+    for both the production and test engines via a shared
+    `enable_sqlite_foreign_keys()` helper in `db/session.py` — without
+    this, SQLite silently ignores invalid FK references by default.
+  - Reset the local `backend/purposeseal.db` dev database file (it's
+    gitignored, disposable demo data — `Base.metadata.create_all` only
+    creates missing tables, it does not add columns to an existing table,
+    so the old `grants` table needed to be recreated to pick up
+    `allowed_operations`).
+- **Important decisions**: see "Grant ↔ DataAsset relationship" and
+  "Usage/policy decision entity" under Database Model above.
+- **Files added**: `backend/app/models/{enums,data_asset}.py`,
+  `backend/app/schemas/data_asset.py`, `backend/tests/test_domain_model.py`.
+- **Files modified**: `backend/app/models/{grant,__init__}.py` (added
+  `allowed_operations`), `backend/app/schemas/{grant,__init__}.py` (added
+  `allowed_operations` to `GrantCreate`/`GrantOut`),
+  `backend/app/services/grant_service.py` (defaults `allowed_operations`
+  to all four operations, includes it in the `GRANT_CREATED` audit
+  details), `backend/app/db/session.py` (FK pragma helper),
+  `backend/tests/conftest.py` (enables FK pragma on the test engine, adds
+  a `db_session` fixture), `backend/tests/test_grants.py` (3 new tests for
+  the `allowed_operations` field).
+- **Endpoints changed**: `POST /grants` gained an optional
+  `allowed_operations` field (list of `AllowedOperation`); omitting it
+  defaults to all four. No breaking change — existing callers are
+  unaffected.
+- **Tests added**:
+  - `backend/tests/test_domain_model.py` (8 tests, covering the required
+    checklist): create + retrieve an original asset; create a child asset
+    relationship; root/parent relationship is valid (root has `None`
+    `root_asset_id`, child points at root's id); persist a `Grant`;
+    `allowed_operations` survives persistence; an audit event persists;
+    an invalid `parent_asset_id` reference raises `IntegrityError`
+    (rolled back cleanly); an invalid `origin_grant_id` reference raises
+    `IntegrityError` (rolled back cleanly). All run against a fresh
+    per-test SQLite file (via the existing `db_engine`/`db_session`
+    fixtures), never the development database.
+  - `backend/tests/test_grants.py`: `allowed_operations` defaults to all
+    four when omitted; is stored/returned as given when supplied
+    explicitly; an invalid operation value (`"DELETE"`) is rejected with
+    422 by Pydantic before it reaches the database.
+- **Test result**: `24 passed, 2 warnings in 1.59s` (16 from before + 8
+  domain-model tests; the `test_grants.py` count includes 3 new
+  `allowed_operations` tests). No regressions.
+- **Known limitations**: no lifecycle logic implemented — nothing
+  transitions `Grant.status` to `EXPIRED`, nothing creates a `DataAsset`
+  on retrieval, nothing quarantines one on violation; this step is schema
+  only, exactly as scoped. No `UsageDecision` table (see design decision
+  above). No ORM `relationship()` declarations on `DataAsset`'s two
+  self-FKs — tests query by id directly rather than via lineage
+  traversal helpers, since no such helpers were needed to prove
+  persistence.
+
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | GET | /health | Liveness check — `{status, app_name}` |
-| POST | /grants | Create a purpose-bound access grant |
+| POST | /grants | Create a purpose-bound access grant (now accepts optional `allowed_operations`) |
 | GET | /grants | List all grants |
 | GET | /grants/{id} | Get one grant by id |
 
@@ -224,18 +352,38 @@ appended here as each feature lands.)
   boundaries are established once, cheaply, instead of retrofitted later.
 - **Tailwind v4 via `@tailwindcss/vite`** instead of v3's PostCSS config —
   fewer config files, same utility classes, current stable release.
+- **`allowed_operations` stored as a JSON column, not a normalized
+  many-to-many table** — a small, fixed enum per grant doesn't justify a
+  join table at this scale; the project's own guidance says to normalize
+  "where sensible without overengineering."
+- **`DataAsset.origin_grant_id` denormalized onto every asset (root and
+  copies)** rather than only on the root — the whole point of the system
+  is "which purpose justified this data," so that lookup is made a single
+  column read instead of a lineage-chain walk, at the cost of one integer
+  column repeated down the chain. See "Grant ↔ DataAsset relationship"
+  under Database Model.
+- **SQLite FK enforcement explicitly turned on** — SQLite ignores foreign
+  keys by default per connection; without the `PRAGMA foreign_keys=ON`
+  pragma, invalid lineage/grant references would silently persist instead
+  of failing, which the project's reliability priority can't afford.
 
 ## Known Issues / Deferred Work
 
-- No grant expiry transition, data retrieval, copy/lineage tracking,
-  purpose-violation policy engine, or quarantine action yet — these are
-  the next features per the hackathon priority list.
+- No lifecycle/business logic yet: nothing transitions `Grant.status` to
+  `EXPIRED`, nothing creates a `DataAsset` on retrieval, nothing detects a
+  purpose violation or quarantines an asset. Schema only, so far.
 - No revoke-grant endpoint yet.
+- No `UsageDecision` table yet — deferred until the policy-evaluation
+  feature defines its real shape (see design decision above).
 - Frontend has no routing and no feature screens yet (by design for this
   step) — grants UI, retrieval UI, audit trail view, and lineage graph all
   come with their respective backend features.
 - No `.env.example` committed yet (nothing currently requires one to run
   locally); add one if/when a required env var appears.
+- No schema migration tool (Alembic etc.) — tables are created via
+  `Base.metadata.create_all`, which only adds missing tables, never alters
+  existing ones. Fine for a hackathon MVP (the local dev db can just be
+  deleted and recreated), but worth naming as a real limitation.
 
 ## Git History
 
@@ -248,9 +396,12 @@ appended here as each feature lands.)
 - **Foundation — layered architecture, config, error handling, frontend
   shell**: recommended commit message
   `chore(core): scaffold PurposeSeal application`.
+- **Core Domain Model — DataAsset, enums, FK-safe persistence**:
+  recommended commit message `feat(domain): add PurposeSeal core data model`.
 
 ## Next Step
 
-Retrieve simulated sensitive data under an active grant, and associate the
-retrieved data with the purpose it was accessed under (attach/inherit the
+Retrieve simulated sensitive data under an active grant: create a
+`DataAsset` row (root, `origin_grant_id` pointing at the grant) and
+associate it with the purpose it was accessed under (attach/inherit the
 purpose seal), per the hackathon priority list.
