@@ -163,6 +163,30 @@ justify a dedicated, queryable `UsageDecision` table so judges can filter
 decisions by grant/asset; that table is deferred to that feature, not
 built speculatively now.
 
+### Purpose Seal propagation — design decision
+
+A retrieved/derived `DataAsset` must be able to answer, later: where did
+this data originate, which grant authorized its retrieval, what purpose
+justified it, and when does that purpose expire. **No new columns were
+added to store any of this.** The existing FK fields already fully
+answer the first two questions (`parent_asset_id` / `root_asset_id` for
+lineage, `origin_grant_id` for authorization), and the latter two
+(purpose, expiry) are answered by joining through `origin_grant_id` to
+the `Grant` row at *read time* — `grant_service`'s pattern of computing
+derived facts on demand (as with live-evaluated grant status) extends
+naturally to assets. `services/asset_service.py:to_data_asset_out`
+performs this join and returns `origin_purpose` and
+`origin_grant_expires_at` as response-only, computed fields.
+
+The alternative — copying `purpose` and `expires_at` onto every
+retrieved `DataAsset` at creation time — was rejected for the same
+reason `resource_id` was removed from `Grant`: it would create a second,
+driftable copy of information the grant already owns (e.g. if a grant
+were ever revoked or corrected, every asset retrieved under it would
+silently keep stale values). Joining through the FK means there is
+exactly one place purpose/expiry live, and every retrieved asset always
+reflects the grant's current values.
+
 ## Implemented Features
 
 ### Feature 1 — Create purpose-bound access grant
@@ -526,6 +550,101 @@ built speculatively now.
   (the actual purpose-violation check against retrieved/derived assets)
   is explicitly out of scope for this step.
 
+### Data Retrieval and Purpose Seal Propagation
+
+- **What was implemented**: `POST /retrievals` — the first place actual
+  policy enforcement happens end-to-end. Given `{grant_id, actor,
+  asset_id, operation}`, it:
+  1. loads the grant (404 if it doesn't exist);
+  2. checks `grant.subject == actor` (else `403 actor_mismatch`);
+  3. checks `grant.asset_id == asset_id` (else `403 asset_mismatch`);
+  4. evaluates the grant via the existing `grant_service.evaluate_grant_status`
+     (else `403 grant_not_active`, reusing its `reason_code`/
+     `human_readable_reason` so expiry/revocation explanations are
+     defined in exactly one place);
+  5. checks `operation` is in `grant.allowed_operations` (else
+     `403 operation_not_permitted`);
+  6. only then creates a new `DataAsset` — the retrieved copy — with
+     `parent_asset_id`/`root_asset_id` pointing at the source asset and
+     `origin_grant_id` pointing at the grant (the "purpose seal"; see the
+     design decision under Database Model above);
+  7. writes a `DATA_RETRIEVED` audit event referencing the new asset.
+  Any of steps 2–5 failing writes a `DATA_RETRIEVAL_DENIED` audit event
+  against the *grant* instead (distinct event type, so it can never be
+  mistaken for a successful retrieval) and raises before any `DataAsset`
+  or `DATA_RETRIEVED` event is created — failure is atomic with respect
+  to what gets persisted.
+  - A SHA-256 `fingerprint` is computed for every retrieved copy, hashed
+    from the **root asset's** stable identity (id, name, asset_type) —
+    see the explicit limitation below.
+  - `services/asset_service.py:to_data_asset_out` serializes any
+    `DataAsset` with its purpose seal resolved (`origin_purpose`,
+    `origin_grant_expires_at`) plus a convenience
+    `effective_root_asset_id` (`root_asset_id or id`, so callers never
+    need to know the NULL-means-root convention themselves).
+- **Fingerprint limitation (explicit, not a bug)**: the fingerprint is a
+  SHA-256 hash of a small string standing in for "this asset's content"
+  (there is no real file content in this simulated MVP). Two copies
+  retrieved from the same root asset get the *same* fingerprint, which is
+  correct — but this can only ever prove byte-for-byte identity. It
+  **cannot** detect that a summarized, reworded, partially copied, or
+  otherwise transformed version of the data was derived from this asset;
+  a real adversary editing the content even slightly defeats an exact
+  hash. Detecting transformed derivatives would need similarity/content
+  analysis, explicitly out of scope here.
+- **Important decisions**: see "Purpose Seal propagation — design
+  decision" under Database Model above for why no new columns were added
+  to `DataAsset` to carry purpose/expiry. Also fixed a real bug found
+  while wiring this up: `schemas/data_asset.py:DataAssetOut.origin_grant_id`
+  was declared as a required `int`, even though the underlying model
+  column has been nullable since the Domain Model Correction step —
+  serializing any original/root asset (where it's legitimately `None`)
+  would have raised a response-validation error. Corrected to
+  `Optional[int]`; caught only now because this was the first time
+  `DataAssetOut` was actually used by an endpoint.
+- **Files added**: `backend/app/api/retrievals.py`,
+  `backend/app/schemas/retrieval.py`,
+  `backend/app/services/{retrieval_service,asset_service,fingerprint}.py`,
+  `backend/tests/test_retrieval.py`.
+- **Files modified**: `backend/app/core/errors.py` (added
+  `ForbiddenError`, HTTP 403), `backend/app/schemas/data_asset.py`
+  (`origin_grant_id` → `Optional[int]`; added `effective_root_asset_id`,
+  `origin_purpose`, `origin_grant_expires_at`), `backend/app/schemas/__init__.py`,
+  `backend/app/api/__init__.py` (registered the retrievals router).
+- **Endpoints added**: `POST /retrievals`.
+- **Tests added** (`backend/tests/test_retrieval.py`, 9 tests, all
+  against isolated per-test SQLite databases): successful retrieval;
+  correct root linkage (`parent_asset_id`/`root_asset_id`/
+  `effective_root_asset_id` all point at the source asset); correct
+  grant linkage (`origin_grant_id`, `origin_purpose`,
+  `origin_grant_expires_at` match the grant); a `DATA_RETRIEVED` audit
+  event is created; an expired grant is denied (`clock.advance()`
+  controlled time, `403 grant_not_active`, zero new `DataAsset` rows,
+  zero `DATA_RETRIEVED` events, one `DATA_RETRIEVAL_DENIED` event); wrong
+  actor denied (`403 actor_mismatch`); wrong asset denied
+  (`403 asset_mismatch`, using a second seeded asset); `VIEW` not
+  permitted when the grant only allows `ANALYZE`
+  (`403 operation_not_permitted`); retrieval against a nonexistent grant
+  returns `404`. Every denial test explicitly asserts the `DataAsset`
+  count is unchanged, directly proving failed retrieval never produces a
+  successful retrieval record.
+- **Test result**: `38 passed, 2 warnings in 4.30s` — full suite (8 domain
+  model + 4 foundation + 17 grants + 9 retrieval), zero regressions.
+  Manually verified end-to-end against a live `uvicorn` process: seeded
+  `patient_lab_104`, created a grant for `researcher_01` /
+  `clinical_trial_screening` / `VIEW,ANALYZE,COPY`, retrieved it
+  successfully (seal fields all correct, 64-character fingerprint),
+  then confirmed a wrong-actor attempt and an `EXPORT` (not in the
+  grant's allowed operations) attempt both cleanly denied with
+  `403` and a clear `error_code`.
+- **Known limitations**: only one level of retrieval is exercised here
+  (original → retrieved copy); making a *copy of a copy* (the next
+  hackathon step) should work with the same schema (`parent_asset_id`
+  would point at the retrieved copy, `root_asset_id` still at the true
+  root) but isn't implemented or tested yet. No endpoint lists retrieved
+  assets — only the direct `POST /retrievals` response and DB inspection
+  currently expose them.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -535,9 +654,11 @@ built speculatively now.
 | GET | /grants | List all grants (with live-evaluated `status`) |
 | GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
 | GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
+| POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` |
 
-No endpoint yet creates a `DataAsset` — one must currently be seeded
-directly via the ORM (as the tests do) before a grant can reference it.
+No endpoint yet creates an *original* `DataAsset` — one must currently be
+seeded directly via the ORM (as the tests do) before a grant can
+reference it or a retrieval can happen against it.
 
 ## Demo Journey
 
@@ -549,13 +670,18 @@ directly via the ORM (as the tests do) before a grant can reference it.
    allowed operations — grant is created, `ACTIVE`, and audited.
 4. `GET /grants/{id}/status` — shows `ACTIVE` with a
    `WITHIN_VALIDITY_WINDOW` explanation.
-5. Advance the simulated clock past the grant's expiry
+5. `POST /retrievals` with the grant id, the same actor, the same asset,
+   and a permitted operation — a new, purpose-sealed `DataAsset` is
+   created (linked to the original and the grant) and `DATA_RETRIEVED` is
+   audited.
+6. Advance the simulated clock past the grant's expiry
    (`clock.advance(minutes=...)`, exercised in tests; not yet exposed via
-   an endpoint) — `GET /grants/{id}/status` now shows `EXPIRED` with an
-   `EXPIRY_TIME_PASSED` explanation, computed live, with no write to the
-   database.
+   an endpoint) — `GET /grants/{id}/status` now shows `EXPIRED`, and a
+   further `POST /retrievals` against the same grant is now denied
+   (`403 grant_not_active`) with a `DATA_RETRIEVAL_DENIED` audit event
+   instead of a retrieval.
 
-(Later steps — retrieval, copy tracking, violation detection,
+(Later steps — copy-of-copy lineage, violation detection,
 blocking/quarantine, and their corresponding frontend screens — will be
 appended here as each feature lands.)
 
@@ -607,16 +733,38 @@ appended here as each feature lands.)
 - **`allowed_operations` is required, not defaulted** (changed from the
   previous step) — this step's explicit validation rules asked for it
   alongside actor/purpose as a required field, not an optional one.
+- **Purpose/expiry answered by joining through `origin_grant_id`, never
+  duplicated onto `DataAsset`** — see "Purpose Seal propagation" under
+  Database Model. Consistent with the earlier `resource_id` removal: one
+  authoritative source per fact, computed on read rather than copied at
+  write time.
+- **Fingerprint hashes the root asset's stable identity, not the
+  retrieval event** — every copy retrieved from the same original gets
+  the same SHA-256 fingerprint, the way a real content hash would;
+  documented explicitly as unable to detect transformed/derived content,
+  only byte-identical copies (see the retrieval feature's known
+  limitations).
+- **Failed retrieval writes a distinctly-typed `DATA_RETRIEVAL_DENIED`
+  audit event, never `DATA_RETRIEVED`** — keeps the audit trail
+  unambiguous about what actually succeeded, per the project's
+  auditability rule against faking successful entries.
 
 ## Known Issues / Deferred Work
 
-- Nothing creates a `DataAsset` on retrieval yet, nothing detects a
-  purpose violation, nothing quarantines an asset, and copied-data
-  enforcement is not implemented — all explicitly out of scope so far.
+- Purpose-violation detection (evaluating *continued* use of
+  already-retrieved data after its grant expires) is not implemented —
+  this step only covers the initial, legitimate retrieval. Nothing
+  quarantines an asset yet.
+- Copy-of-a-copy lineage (retrieving from an already-retrieved asset
+  rather than the original) is untested — the schema should support it
+  (`parent_asset_id` would point at the copy, `root_asset_id` still at
+  the true root) but this hasn't been exercised.
 - No revoke-grant endpoint yet (the evaluation logic supports `REVOKED`,
   but nothing can set it).
 - No endpoint exposes simulated time advancement (`clock.advance()`) —
   only reachable from tests/scripts today.
+- No endpoint lists or fetches a retrieved `DataAsset` by id — only the
+  `POST /retrievals` response and direct DB inspection expose one today.
 - No `UsageDecision` table yet — deferred until the policy-evaluation
   feature defines its real shape (see design decision above).
 - Frontend has no routing and no feature screens yet (by design for this
@@ -647,15 +795,13 @@ appended here as each feature lands.)
   `fix(domain): separate source assets from purpose grants`.
 - **Purpose Grant Lifecycle — status evaluation and stricter validation**:
   recommended commit message `feat(grants): add purpose-bound access lifecycle`.
+- **Data Retrieval and Purpose Seal Propagation**: recommended commit
+  message `feat(retrieval): propagate purpose seal to retrieved data`.
 
 ## Next Step
 
-Retrieve simulated sensitive data under an active grant: create a
-retrieved/derived `DataAsset` row (`parent_asset_id`/`root_asset_id`
-pointing at the original, `origin_grant_id` pointing at the grant that
-authorized it) and associate it with the purpose it was accessed under
-(attach/inherit the purpose seal), per the hackathon priority list. This
-will also need a way to create the *original* `DataAsset` in the first
-place (currently only seedable via the ORM, not via any endpoint), and
-should use `grant_service.is_grant_active` to enforce that retrieval is
-only allowed under a currently-active grant.
+Create and track a copy: exercise retrieval against an already-retrieved
+`DataAsset` (a copy of a copy) to confirm lineage holds multiple levels
+deep, and/or begin the purpose-violation feature — evaluating continued
+use of already-retrieved data after its originating grant has expired,
+per the hackathon priority list.

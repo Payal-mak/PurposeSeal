@@ -14,7 +14,10 @@ class DataAssetOut(BaseModel):
     asset_type: str
     parent_asset_id: Optional[int]
     root_asset_id: Optional[int]
-    origin_grant_id: int
+    effective_root_asset_id: int
+    origin_grant_id: Optional[int]
+    origin_purpose: Optional[str] = None
+    origin_grant_expires_at: Optional[datetime] = None
     state: AssetState
     fingerprint: Optional[str]
     created_at: datetime

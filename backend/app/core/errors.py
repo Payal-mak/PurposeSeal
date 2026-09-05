@@ -18,6 +18,11 @@ class NotFoundError(AppError):
         super().__init__(404, error_code, message)
 
 
+class ForbiddenError(AppError):
+    def __init__(self, message: str, error_code: str = "forbidden") -> None:
+        super().__init__(403, error_code, message)
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
