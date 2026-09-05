@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.db
+
+# pytest
+.pytest_cache/
+
+# Node / frontend (added when frontend scaffold lands)
+node_modules/
+dist/
+
+# Editor
+.vscode/
