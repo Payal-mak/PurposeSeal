@@ -27,10 +27,13 @@ at the access-grant level.
     `Settings`), `clock.py` (time abstraction), `errors.py` (`AppError`
     hierarchy + exception handlers).
 - **Frontend**: React 19 + Vite 8 + Tailwind CSS v4 (via `@tailwindcss/vite`,
-  no separate `tailwind.config.js`/PostCSS needed under v4). Minimal shell
-  only: `Layout` (header with product name + placeholder nav) and
-  `HealthIndicator` (polls backend `/health` on mount, shows
-  checking/connected/unavailable). No feature screens yet.
+  no separate `tailwind.config.js`/PostCSS needed under v4). `Layout`
+  (header with product name + placeholder nav) and `HealthIndicator`
+  (polls backend `/health` on mount) wrap a single `Dashboard` screen —
+  see "Minimal Judge-Ready Dashboard" under Implemented Features. All API
+  calls go through `src/lib/api.js` (a thin `fetch` wrapper reading
+  `VITE_API_BASE_URL`, default `http://localhost:8000`), never a raw
+  `fetch()` call inside a component.
 - **Time handling**: a single `Clock` singleton (`app/core/clock.py`) is
   the only source of "now" for business logic. It wraps real UTC time plus
   an in-memory offset that can be advanced (`clock.advance(minutes=...)`)
@@ -1255,6 +1258,152 @@ decision -- confirming no collision and full determinism.
   hackathon demo session, but a long-running demo server would
   eventually want a way to reset/clear it.
 
+### Minimal Judge-Ready Dashboard
+
+**Goal**: the first usable frontend — a single dashboard that
+communicates the whole PurposeSeal concept in under 30 seconds, so a
+judge never needs Postman/curl during a demo. No backend changes; this
+feature is purely a frontend consumer of the APIs that already exist
+(`GET /grants`, `GET /assets`, `GET /assets/{id}`,
+`POST /demo/scenarios/*`).
+
+- **`src/lib/api.js`** gained a small `request()` wrapper (shared by
+  every API function) that turns a network failure into "Could not
+  reach the PurposeSeal backend. Is it running?" and a non-2xx response
+  into its backend-provided `message` when present, or a generic
+  "Request failed with status N" otherwise — the UI never shows a raw
+  stack trace or an `Error: ...` string. New functions: `listGrants`,
+  `listAssets(params)`, `getAsset(id)`, `runScenario(key)`.
+- **`Dashboard.jsx`** is the single screen, composed of four
+  presentational sections:
+  - **`SummaryMetrics`** — Active Grants, Tracked Copies, Violations
+    Detected, Quarantined Assets. **Active Grants** (`GET /grants`,
+    live-evaluated `status === 'ACTIVE'`), **Tracked Copies**
+    (`GET /assets`, count of `parent_asset_id !== null`), and
+    **Quarantined Assets** (`GET /assets?state=QUARANTINED`) are always
+    freshly fetched from the backend, refreshed after every scenario
+    run. **Violations Detected** is the one exception — see the design
+    decision below.
+  - **`ScenarioControls`** — the three buttons (`Run Valid Scenario`,
+    `Run Expired-Purpose Scenario`, `Run Purpose-Mismatch Scenario`),
+    calling `POST /demo/scenarios/{legitimate,expired,purpose-mismatch}`
+    directly. All three buttons disable together while any one is
+    running (not just the clicked one) and the active button reads
+    "Running…", with a `role="status"` line underneath — this is the
+    dashboard's whole loading-state story, deliberately not a spinner
+    ("no complex animation").
+  - **`ScenarioResult`** — after a run: **ALLOW**/**BLOCKED** (mapped
+    from the API's `ALLOW`/`DENY`), **Why?** (`reason`), **Original
+    Purpose** and **Expiry** (from the evaluated asset's
+    `origin_purpose`/`origin_grant_expires_at`, fetched via
+    `GET /assets/{id}` right after the scenario call — the scenario
+    response itself only carries `asset_id`, not the asset's
+    provenance), **Requested Purpose** (the `purpose` field on the
+    timeline's `DATA_USE_ATTEMPTED` event — the actual value the policy
+    engine evaluated, not a guessed/hardcoded one), **Asset** (the
+    fetched asset's `name`), and **Corrective Action** (the scenario
+    response's `remediation`, or a fixed "no action needed" message
+    when `remediation` is `null`, i.e. on `ALLOW`). Before any run, and
+    on an error, this section never renders blank — see the design
+    decisions below.
+  - **`JourneyTimeline`** — renders the scenario response's `timeline`
+    array as a chronological list. Each event's raw `event_type` is
+    mapped to a human label (`GRANT_CREATED` → "Grant Created",
+    `ASSET_QUARANTINED` → "Asset Quarantined", etc.), with red/green/
+    grey status dots (red for `PURPOSE_VIOLATION`/`USE_BLOCKED`/
+    `ASSET_QUARANTINED`, green for `USE_ALLOWED`).
+- **"Purpose Expired" has no dedicated backend audit event** — as
+  documented under the policy feature, an expiry-caused denial is
+  logged as `PURPOSE_VIOLATION` with `reason_code: "PURPOSE_EXPIRED"`
+  in its `details`, not as its own event type. Rather than adding a new
+  backend event (out of scope — "do not redesign backend
+  architecture"), `JourneyTimeline` reads that `reason_code` and labels
+  the step "Purpose Expired — Violation Detected" (or "Purpose Mismatch
+  — Violation Detected") purely at render time. This is a frontend
+  presentation decision layered on existing data, not a new backend
+  concept.
+- **"Violations Detected" is a session-local counter, not a backend
+  query** — no `GET`-all-audit-events endpoint exists yet (deferred;
+  see Known Issues), and since every purpose-lifecycle violation
+  quarantines its asset exactly once, a true backend count would always
+  exactly equal the Quarantined Assets count anyway, making the two
+  numbers redundant. Instead, the dashboard counts `PURPOSE_VIOLATION`
+  events actually returned by scenario runs performed in the current
+  browser session (resets on page reload). This is deliberately framed
+  as "this session" in the UI (a caption under the metric) rather than
+  implied to be a global, persistent count.
+
+**Worked example (from a real backend + a real Vite dev server, exact
+request/response contract verified with `curl`, not just component
+tests with mocked `fetch`)**:
+```
+GET  /grants                              -> []
+GET  /assets                              -> []
+GET  /assets?state=QUARANTINED            -> []
+POST /demo/scenarios/legitimate           -> {"decision": "ALLOW", "asset_id": 3, ...}
+GET  /assets/3                            -> {"name": "analysis_dataset_1 (Legitimate Use Demo)",
+                                               "origin_purpose": "clinical_trial_screening",
+                                               "state": "ACTIVE", ...}
+GET  /grants (metrics refresh)            -> [{"status": "ACTIVE", ...}]      => Active Grants: 1
+GET  /assets (metrics refresh)            -> 3 assets, 2 with parent_asset_id => Tracked Copies: 2
+
+POST /demo/scenarios/expired              -> {"decision": "DENY", "reason_code": "PURPOSE_EXPIRED", ...}
+POST /demo/scenarios/purpose-mismatch     -> {"decision": "DENY", "reason_code": "PURPOSE_MISMATCH", ...}
+GET  /assets?state=QUARANTINED            -> 2 assets                        => Quarantined Assets: 2
+```
+A CORS preflight (`OPTIONS /demo/scenarios/legitimate` with
+`Origin: http://localhost:5173`) against the real backend confirmed
+`access-control-allow-origin: http://localhost:5173` — the default
+`cors_origins` setting already covers the frontend's default dev port,
+no configuration change needed.
+
+- **Files added**: `frontend/src/components/{Dashboard,SummaryMetrics,
+  ScenarioControls,ScenarioResult,JourneyTimeline}.jsx`,
+  `frontend/src/components/Dashboard.test.jsx`.
+- **Files modified**: `frontend/src/lib/api.js` (added `request()`
+  wrapper + new API functions), `frontend/src/App.jsx` (renders
+  `Dashboard` instead of the placeholder paragraph).
+- **Tests added** (13 total in `Dashboard.test.jsx`, covering all 6
+  required cases plus extras): dashboard renders all four sections;
+  all three scenario buttons render; loading state shown and all
+  buttons disabled while a scenario runs; successful `ALLOW` result
+  displayed with its reason and "no action needed" corrective action;
+  `BLOCKED` violation result displayed with corrective action and the
+  "Violation Detected"/"Asset Quarantined" timeline steps; a non-2xx
+  scenario response shows a readable error (no `Error:`-prefixed raw
+  text) and the button is rerunnable afterward; a total network failure
+  shows the "could not reach the backend" message.
+- **Test result**: frontend `13 passed` (`npm test`, Vitest); backend
+  regression suite `112 passed, 2 warnings in ~22s` (`pytest`) — zero
+  regressions in either suite.
+- **Manual end-to-end verification**: `npm run build` (production
+  build succeeds, no compile errors) — then a **real** backend
+  (`uvicorn`, isolated SQLite file) and a **real** Vite dev server were
+  started together, with the dev server's served module inspected
+  directly (`curl .../src/lib/api.js`) to confirm it resolves
+  `VITE_API_BASE_URL` to the intended backend at runtime. Every request
+  the dashboard's code issues — `GET /grants`, `GET /assets`,
+  `GET /assets?state=QUARANTINED`, all three
+  `POST /demo/scenarios/*`, `GET /assets/{id}` — was then replayed by
+  hand against that live backend in the same order the component
+  issues them, confirming every field the components read
+  (`status`, `parent_asset_id`, `state`, `name`, `origin_purpose`,
+  `origin_grant_expires_at`, `decision`, `reason`, `remediation`,
+  `timeline[].{event_type,entity_type,entity_id,details,created_at}`)
+  is actually present with the expected shape. This is not the same as
+  clicking through the app in a real browser (no browser-automation
+  tool is available in this environment), but it verifies the full
+  request/response contract the browser-executed code depends on, end
+  to end, against a real (not mocked) backend.
+- **Known limitations**: no literal browser/click-through verification
+  was performed (see above) — only the underlying API contract was
+  confirmed end-to-end. `getAsset()` is an extra round-trip per
+  scenario run purely to obtain a friendly asset name/purpose/expiry;
+  acceptable at this scale. "Violations Detected" resets on page
+  reload (session-local, by design — see above). No routing — the
+  dashboard is the only screen, matching the "one main dashboard"
+  instruction.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -1284,7 +1433,57 @@ these APIs; nothing requires direct ORM/SQLite seeding anymore.
 
 ## Demo Journey
 
-### One-call deterministic scenarios (recommended)
+### Judge demo via the dashboard (recommended — no terminal needed)
+
+This is the intended way to demo PurposeSeal to a judge: two servers,
+one browser tab, three button clicks.
+
+1. **Start the backend** (from `backend/`, with the virtualenv active):
+   ```
+   uvicorn app.main:app --reload
+   ```
+   Confirm it's up at `http://localhost:8000/health`.
+2. **Start the frontend** (from `frontend/`, in a second terminal):
+   ```
+   npm install   # first time only
+   npm run dev
+   ```
+   Open the printed URL — `http://localhost:5173` by default. The
+   backend's default `cors_origins` already allows this origin; no
+   configuration is needed for the default ports.
+3. **Read the Summary row** — four metrics (Active Grants, Tracked
+   Copies, Violations Detected, Quarantined Assets), all `0` on a fresh
+   database.
+4. **Click "Run Valid Scenario."** The button briefly shows "Running…"
+   (all three buttons disable together). The Result panel then shows
+   **ALLOW**, the reason, original/requested purpose (identical here),
+   the grant's expiry, the asset, and "no action needed." The Journey
+   Timeline below shows six steps ending in "Use Allowed." Active
+   Grants and Tracked Copies in the Summary row update to reflect the
+   new grant/copies.
+5. **Click "Run Expired-Purpose Scenario."** Result flips to
+   **BLOCKED**, reason names the expired grant, and Corrective Action
+   suggests issuing a new grant. The timeline ends in "Purpose Expired
+   — Violation Detected" → "Asset Quarantined." Quarantined Assets in
+   the Summary row goes from `0` to `1`; Violations Detected goes from
+   `0` to `1`.
+6. **Click "Run Purpose-Mismatch Scenario."** Result again shows
+   **BLOCKED**, this time naming `clinical_trial_screening` as the
+   original purpose and `marketing_analytics` as the requested one.
+   Timeline ends in "Purpose Mismatch — Violation Detected" → "Asset
+   Quarantined." Quarantined Assets becomes `2`, Violations Detected
+   becomes `2`.
+7. **Re-run any scenario as many times as you like** — every click
+   creates a fresh asset/grant chain (no collisions, no manual
+   cleanup), so the demo can be repeated live without restarting
+   anything.
+8. **To show an API failure recovers gracefully**: stop the backend
+   process, click any scenario button — the Result panel shows "Could
+   not reach the PurposeSeal backend. Is it running?" instead of a
+   blank screen or a stack trace. Restart the backend and click again;
+   it works immediately, no page reload needed.
+
+### One-call deterministic scenarios (recommended for scripting/CI, not live judging)
 
 The fastest way to show the whole product — no manual grant/retrieval
 setup required. Each endpoint drives a complete, self-contained journey
@@ -1512,6 +1711,23 @@ lands.)
   flag as `/dev/clock*`** — they are equally "not real product
   functionality," just canned data generators for showing the product,
   so they get the same production off-switch.
+- **The dashboard fetches its own "Requested Purpose"/"Asset" details
+  rather than the scenario response carrying pre-formatted display
+  text** — `DemoScenarioOut` stays a decision-shaped API contract
+  (`decision`, `reason_code`, `reason`, ids, `timeline`), not a
+  UI-shaped one; the frontend derives everything display-specific
+  (asset name, purpose strings) from that same data via `GET
+  /assets/{id}` and the timeline, keeping the backend response reusable
+  by any future consumer, not just this one screen.
+- **"Violations Detected" is intentionally a session-local counter, not
+  a live backend query** — see the dashboard feature's design decision;
+  no backend change was made to support it, by design (no
+  audit-log-listing endpoint exists yet).
+- **All three scenario buttons disable together while any one is
+  running**, not just the clicked button — prevents a second scenario's
+  writes from interleaving with the first's mid-flight timeline/metrics
+  refresh, keeping the result panel and summary numbers consistent with
+  exactly one completed run at a time.
 
 ## Known Issues / Deferred Work
 
@@ -1524,9 +1740,6 @@ lands.)
 - No revocation of an individual copy/derivative independent of its
   origin grant. `GET /assets/{id}/lineage` returns the entire tree with
   no pagination — fine at hackathon scale.
-- Frontend has no routing and no feature screens yet (by design for this
-  step) — grants UI, retrieval UI, audit trail view, and lineage graph all
-  come with their respective backend features.
 - No `.env.example` committed yet (nothing currently requires one to run
   locally); add one if/when a required env var appears.
 - No schema migration tool (Alembic etc.) — tables are created via
@@ -1536,6 +1749,23 @@ lands.)
 - Demo scenarios are fixed, not parameterizable, and leave their
   generated rows in the database permanently (no cleanup/reset
   endpoint) — acceptable for a hackathon demo session.
+- ~~Frontend has no routing and no feature screens yet~~ **Resolved** by
+  the "Minimal Judge-Ready Dashboard" feature — a single dashboard
+  screen now covers the full demo journey. Still no client-side
+  routing (by design — "one main dashboard," not multiple screens); a
+  dedicated lineage-graph visualization and a global audit-trail view
+  remain future work.
+- No literal browser/click-through verification tooling in this
+  environment (no Playwright/Puppeteer installed) — the dashboard
+  feature's manual verification confirmed the full API request/response
+  contract end-to-end against a real backend and a real Vite dev
+  server, but did not simulate an actual mouse click in a rendered
+  page. Frontend component tests (mocked `fetch`) plus this contract
+  verification are the current substitute.
+- The dashboard's "Violations Detected" metric resets on page reload
+  (session-local counter, by design); "Active Grants," "Tracked
+  Copies," and "Quarantined Assets" are always live from the backend
+  and persist across reloads.
 
 ## Git History
 
@@ -1569,13 +1799,18 @@ lands.)
   `feat(assets): add source asset creation and grant revocation`.
 - **Deterministic Demo Scenario Engine**: recommended commit message
   `feat(demo): add deterministic PurposeSeal scenarios`.
+- **Minimal Judge-Ready Dashboard**: recommended commit message
+  `feat(ui): add judge-ready PurposeSeal dashboard`.
 
 ## Next Step
 
-With the core loop complete (create grant → retrieve → copy/derive →
-evaluate use → detect violation → quarantine), fully reachable over HTTP
-(create original asset → revoke a grant), and now demoable in three
-single-call scenarios with full timelines, remaining work is the
-minimal usable frontend walking a judge through the whole journey
-end-to-end (ideally driven by the three `/demo/scenarios/*` endpoints
-plus a timeline/activity view), per the hackathon priority list.
+The full PurposeSeal loop (create grant → retrieve → copy/derive →
+evaluate use → detect violation → quarantine) is complete, reachable
+entirely over HTTP, demoable in three single-call scenarios, and now
+has a judge-ready dashboard driving those scenarios with a live
+Summary/Result/Timeline view — see "Minimal Judge-Ready Dashboard"
+above for exact demo steps. Remaining work, in rough priority order:
+a real browser/click-through verification pass once a browser-
+automation tool is available (see Known Issues), a dedicated
+audit-trail view (beyond the per-scenario timeline), and a lineage
+graph visualization for `GET /assets/{id}/lineage`.
