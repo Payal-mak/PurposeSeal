@@ -1,8 +1,9 @@
 import enum
 
-from sqlalchemy import JSON, Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, String
+from sqlalchemy import JSON, Column, Enum as SQLEnum, ForeignKey, Integer, String
 
 from ..db.base import Base
+from ..db.types import UTCDateTime
 from .enums import AllowedOperation
 
 
@@ -32,5 +33,5 @@ class Grant(Base):
     asset_id = Column(Integer, ForeignKey("data_assets.id"), nullable=False, index=True)
     allowed_operations = Column(JSON, nullable=False, default=_all_operations)
     status = Column(SQLEnum(GrantStatus), nullable=False, default=GrantStatus.ACTIVE)
-    created_at = Column(DateTime(timezone=True), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)

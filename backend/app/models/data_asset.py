@@ -1,8 +1,9 @@
 import enum
 
-from sqlalchemy import Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, String
+from sqlalchemy import Column, Enum as SQLEnum, ForeignKey, Integer, String
 
 from ..db.base import Base
+from ..db.types import UTCDateTime
 
 
 class AssetState(str, enum.Enum):
@@ -39,4 +40,4 @@ class DataAsset(Base):
     origin_grant_id = Column(Integer, ForeignKey("grants.id"), nullable=True, index=True)
     state = Column(SQLEnum(AssetState), nullable=False, default=AssetState.ACTIVE)
     fingerprint = Column(String, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)

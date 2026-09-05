@@ -423,14 +423,118 @@ built speculatively now.
   created against assets seeded directly via the ORM (tests) or a future
   admin/demo-seed endpoint — not yet via any HTTP call.
 
+### Purpose Grant Lifecycle — status evaluation and stricter validation
+
+- **What was implemented**:
+  - `GET /grants/{id}/status` — evaluates a grant's *current* status
+    (`ACTIVE`/`EXPIRED`/`REVOKED`) live, with a `reason_code` and
+    `human_readable_reason` explaining the decision
+    (`WITHIN_VALIDITY_WINDOW`, `EXPIRY_TIME_PASSED`, or
+    `EXPLICITLY_REVOKED`). Implemented as `grant_service.evaluate_grant_status`,
+    a pure function: it reads `clock.now()` and the grant's stored
+    `status`/`expires_at`, and **never writes back to the database** — the
+    stored `status` column only ever changes via an explicit action
+    (creation → `ACTIVE`; a future revoke action → `REVOKED`).
+    `EXPIRED` is always derived at read time from `expires_at`, never
+    persisted, satisfying "do not silently mutate unrelated state."
+  - `GET /grants` and `GET /grants/{id}` now also serialize the
+    **live-evaluated** status (via a new `grant_service.to_grant_out`
+    helper) instead of the raw stored column, so a grant past its expiry
+    shows `EXPIRED` immediately everywhere, not just at the dedicated
+    `/status` endpoint.
+  - `allowed_operations` on `POST /grants` changed from optional
+    (defaulting to all four operations) to **required, with at least one
+    entry** — matching this step's explicit validation rules. Pydantic's
+    `min_length=1` plus the existing `AllowedOperation` enum together
+    reject a missing field, an empty list, and any unsupported operation
+    value, all with 422.
+  - Confirmed "expiry must be after issue time" is enforced structurally
+    rather than by an extra check: the API only ever accepts a relative
+    `duration_minutes` (never a raw `expires_at`), and `duration_minutes`
+    must be `> 0`, so a computed `expires_at` can never be at or before
+    `created_at`.
+- **Bug found and fixed along the way**: comparing `clock.now()`
+  (timezone-aware UTC) against a `Grant.expires_at` read back from SQLite
+  raised `TypeError: can't compare offset-naive and offset-aware
+  datetimes`. SQLite has no native timezone-aware datetime type, so
+  `DateTime(timezone=True)` silently returns naive values on read.
+  Fixed at the root with a new `UTCDateTime` `TypeDecorator`
+  (`app/db/types.py`) that normalizes every datetime to timezone-aware
+  UTC on both write and read, applied to all three models' timestamp
+  columns (`Grant`, `DataAsset`, `AuditLog`) — not just the one
+  comparison site, since every future feature that compares timestamps
+  (expiry checks are the core of this project) would otherwise hit the
+  same bug.
+- **Important decisions**:
+  - Evaluated status is computed, never persisted — the alternative (a
+    background job or request-time write flipping `status` to `EXPIRED`)
+    would violate "do not silently mutate unrelated state" and add
+    complexity a pure read doesn't need.
+  - `allowed_operations` required-with-`min_length=1` was a deliberate
+    breaking change from the prior "defaults to all four" behavior,
+    because this step's validation rules explicitly listed "at least one
+    allowed operation is required" alongside actor/purpose as required
+    fields. The now-unused ORM-level default on `Grant.allowed_operations`
+    was left in place as a harmless defensive fallback for direct ORM
+    construction (e.g. in tests), not removed.
+- **Files added**: `backend/app/db/types.py` (`UTCDateTime`).
+- **Files modified**: `backend/app/models/{grant,data_asset,audit_log}.py`
+  (switched to `UTCDateTime`), `backend/app/schemas/grant.py`
+  (`allowed_operations` required; added `GrantStatusOut`),
+  `backend/app/schemas/__init__.py` (export `GrantStatusOut`),
+  `backend/app/services/grant_service.py` (added
+  `evaluate_grant_status`, `is_grant_active`, `to_grant_out`; removed the
+  allowed-operations default-fill), `backend/app/api/grants.py` (added
+  the `/status` route; responses now go through `to_grant_out`),
+  `backend/tests/test_grants.py` (every grant-creation call now passes
+  `allowed_operations`; added tests for missing/empty allowed operations
+  and both status-evaluation scenarios).
+- **Endpoints changed**: `POST /grants` — `allowed_operations` is now
+  required (breaking change; previously optional with a default). New:
+  `GET /grants/{id}/status`.
+- **Tests added/updated** (all against isolated per-test SQLite
+  databases):
+  - `test_create_grant_missing_allowed_operations_returns_422`,
+    `test_create_grant_with_empty_allowed_operations_returns_422` (new).
+  - `test_active_grant_status_evaluation` — creates a grant, checks
+    `/status` returns `ACTIVE` / `WITHIN_VALIDITY_WINDOW`.
+  - `test_expired_grant_status_evaluation_using_controlled_time` — creates
+    a grant, advances the abstracted clock past its expiry
+    (`clock.advance(minutes=31)`), confirms `/status` and `GET
+    /grants/{id}` both show `EXPIRED` / `EXPIRY_TIME_PASSED`, **and**
+    directly queries the database to confirm the stored `status` column
+    is still `ACTIVE` — proving evaluation never mutates persisted state.
+  - `test_grant_status_for_nonexistent_grant_returns_404`.
+  - Every pre-existing grant-creation test updated to pass
+    `allowed_operations` explicitly (previously relied on the removed
+    default).
+  - Removed `test_create_grant_defaults_allowed_operations_to_all_four`
+    — the default behavior it tested no longer exists, per the changed
+    domain rule.
+- **Test result**: `29 passed, 2 warnings in 4.78s` — full suite (8 domain
+  model + 4 foundation + 17 grants), zero regressions. Also manually
+  verified end-to-end against a live `uvicorn` process: created a grant,
+  confirmed `ACTIVE`/`WITHIN_VALIDITY_WINDOW`, advanced the clock 31
+  simulated minutes, confirmed both `/status` and `GET /grants/{id}` show
+  `EXPIRED`/`EXPIRY_TIME_PASSED` with real ISO-8601 UTC (`Z`-suffixed)
+  timestamps.
+- **Known limitations**: no revoke endpoint yet, so `REVOKED` is
+  reachable in code (`evaluate_grant_status` handles it) but not yet
+  through any API call. No endpoint exposes `clock.advance()` — time
+  simulation is currently only exercised from tests/scripts, not
+  demo-able through the frontend or a REST call. Copied-data enforcement
+  (the actual purpose-violation check against retrieved/derived assets)
+  is explicitly out of scope for this step.
+
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | GET | /health | Liveness check — `{status, app_name}` |
-| POST | /grants | Create a purpose-bound access grant for an existing `asset_id` (accepts optional `allowed_operations`) |
-| GET | /grants | List all grants |
-| GET | /grants/{id} | Get one grant by id |
+| POST | /grants | Create a purpose-bound access grant for an existing `asset_id` (requires `allowed_operations`, at least one) |
+| GET | /grants | List all grants (with live-evaluated `status`) |
+| GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
+| GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
 
 No endpoint yet creates a `DataAsset` — one must currently be seeded
 directly via the ORM (as the tests do) before a grant can reference it.
@@ -439,11 +543,19 @@ directly via the ORM (as the tests do) before a grant can reference it.
 
 1. Open the frontend shell — product name, layout, and a live "Backend
    connected" indicator confirm the stack is wired end-to-end.
-2. (Not yet exposed via API) An original `DataAsset` exists.
-3. `POST /grants` with a subject, purpose, `asset_id`, and duration —
-   grant is created, `ACTIVE`, and audited.
+2. (Not yet exposed via API) An original `DataAsset` exists, e.g.
+   `patient_lab_104`.
+3. `POST /grants` with an actor, purpose, `asset_id`, duration, and
+   allowed operations — grant is created, `ACTIVE`, and audited.
+4. `GET /grants/{id}/status` — shows `ACTIVE` with a
+   `WITHIN_VALIDITY_WINDOW` explanation.
+5. Advance the simulated clock past the grant's expiry
+   (`clock.advance(minutes=...)`, exercised in tests; not yet exposed via
+   an endpoint) — `GET /grants/{id}/status` now shows `EXPIRED` with an
+   `EXPIRY_TIME_PASSED` explanation, computed live, with no write to the
+   database.
 
-(Later steps — retrieval, copy tracking, expiry, violation detection,
+(Later steps — retrieval, copy tracking, violation detection,
 blocking/quarantine, and their corresponding frontend screens — will be
 appended here as each feature lands.)
 
@@ -481,13 +593,30 @@ appended here as each feature lands.)
   keys by default per connection; without the `PRAGMA foreign_keys=ON`
   pragma, invalid lineage/grant references would silently persist instead
   of failing, which the project's reliability priority can't afford.
+- **All DateTime columns use a custom `UTCDateTime` type, not SQLAlchemy's
+  `DateTime(timezone=True)` directly** — SQLite silently drops timezone
+  info on that type, which broke the very first `clock.now()` vs.
+  `expires_at` comparison. Normalizing at the column-type level fixes it
+  for every current and future timestamp comparison, not just one call
+  site.
+- **Grant status is computed at read time, never persisted as EXPIRED**
+  — the stored `status` column is an explicit lifecycle flag (set only by
+  creation or a future revoke action); "is this grant currently active"
+  is always derived from `expires_at` vs. `clock.now()` on demand, so a
+  GET request can never have the side effect of mutating a row.
+- **`allowed_operations` is required, not defaulted** (changed from the
+  previous step) — this step's explicit validation rules asked for it
+  alongside actor/purpose as a required field, not an optional one.
 
 ## Known Issues / Deferred Work
 
-- No lifecycle/business logic yet: nothing transitions `Grant.status` to
-  `EXPIRED`, nothing creates a `DataAsset` on retrieval, nothing detects a
-  purpose violation or quarantines an asset. Schema only, so far.
-- No revoke-grant endpoint yet.
+- Nothing creates a `DataAsset` on retrieval yet, nothing detects a
+  purpose violation, nothing quarantines an asset, and copied-data
+  enforcement is not implemented — all explicitly out of scope so far.
+- No revoke-grant endpoint yet (the evaluation logic supports `REVOKED`,
+  but nothing can set it).
+- No endpoint exposes simulated time advancement (`clock.advance()`) —
+  only reachable from tests/scripts today.
 - No `UsageDecision` table yet — deferred until the policy-evaluation
   feature defines its real shape (see design decision above).
 - Frontend has no routing and no feature screens yet (by design for this
@@ -516,6 +645,8 @@ appended here as each feature lands.)
 - **Domain Model Correction — separate source assets from purpose
   grants**: recommended commit message
   `fix(domain): separate source assets from purpose grants`.
+- **Purpose Grant Lifecycle — status evaluation and stricter validation**:
+  recommended commit message `feat(grants): add purpose-bound access lifecycle`.
 
 ## Next Step
 
@@ -525,4 +656,6 @@ pointing at the original, `origin_grant_id` pointing at the grant that
 authorized it) and associate it with the purpose it was accessed under
 (attach/inherit the purpose seal), per the hackathon priority list. This
 will also need a way to create the *original* `DataAsset` in the first
-place (currently only seedable via the ORM, not via any endpoint).
+place (currently only seedable via the ORM, not via any endpoint), and
+should use `grant_service.is_grant_active` to enforce that retrieval is
+only allowed under a currently-active grant.

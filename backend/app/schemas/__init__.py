@@ -1,4 +1,4 @@
 from .data_asset import DataAssetOut
-from .grant import GrantCreate, GrantOut
+from .grant import GrantCreate, GrantOut, GrantStatusOut
 
-__all__ = ["GrantCreate", "GrantOut", "DataAssetOut"]
+__all__ = ["GrantCreate", "GrantOut", "GrantStatusOut", "DataAssetOut"]
