@@ -82,13 +82,26 @@ function LineageNode({ data }) {
 
 const NODE_TYPES = { lineage: LineageNode }
 
-function Field({ label, value }) {
+function Field({ label, value, title }) {
   return (
     <div>
       <dt className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</dt>
-      <dd className="mt-0.5 text-sm text-slate-800">{value}</dd>
+      <dd className="mt-0.5 text-sm text-slate-800" title={title}>
+        {value}
+      </dd>
     </div>
   )
+}
+
+// A SHA-256 hex digest is 64 characters -- far too long to sit in a
+// narrow detail panel usefully. Showing the first 12 hex characters is
+// enough to visually confirm "this matches / doesn't match" against
+// another node's fingerprint at a glance; the full value is still one
+// hover away via the `title` attribute, and nothing is truncated in
+// the underlying data or the API response, only this display.
+function shortenFingerprint(fingerprint) {
+  if (!fingerprint) return null
+  return `${fingerprint.slice(0, 12)}…`
 }
 
 export default function LineageGraph({ lineage, grantStatusById, error }) {
@@ -183,6 +196,11 @@ export default function LineageGraph({ lineage, grantStatusById, error }) {
               }
             />
             <Field label="Status" value={computeNodeStatus(selectedNode, grantStatusById ?? {})} />
+            <Field
+              label="Fingerprint"
+              value={shortenFingerprint(selectedNode.fingerprint) ?? 'N/A (original source asset)'}
+              title={selectedNode.fingerprint ?? undefined}
+            />
           </dl>
         ) : (
           <p className="text-sm text-slate-500">Click a node to see its details.</p>

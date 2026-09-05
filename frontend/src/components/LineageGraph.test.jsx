@@ -109,4 +109,33 @@ describe('LineageGraph', () => {
     expect(screen.getAllByText('#1', { exact: true })).toHaveLength(3)
     expect(screen.getByText('clinical_trial_screening')).toBeInTheDocument()
   })
+
+  it('shows a shortened fingerprint (with the full value on hover) for a node that has one', () => {
+    render(<LineageGraph lineage={SAMPLE_LINEAGE} grantStatusById={{ 1: 'ACTIVE' }} />)
+
+    fireEvent.click(screen.getByText('Retrieved Copy'))
+
+    const fingerprintValue = screen.getByText('abc…')
+    expect(fingerprintValue).toBeInTheDocument()
+    expect(fingerprintValue).toHaveAttribute('title', 'abc')
+  })
+
+  it('shows a clear placeholder, not a crash, for a root asset with no fingerprint', () => {
+    render(<LineageGraph lineage={SAMPLE_LINEAGE} grantStatusById={{ 1: 'ACTIVE' }} />)
+
+    fireEvent.click(screen.getByText('Patient Lab Result #104'))
+
+    expect(screen.getByText(/N\/A \(original source asset\)/)).toBeInTheDocument()
+  })
+
+  it('shows different fingerprints for a retrieved copy and its derived/transformed descendant', () => {
+    render(<LineageGraph lineage={SAMPLE_LINEAGE} grantStatusById={{ 1: 'ACTIVE' }} />)
+
+    fireEvent.click(screen.getByText('Retrieved Copy'))
+    expect(screen.getByText('abc…')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Analysis Dataset'))
+    expect(screen.getByText('def…')).toBeInTheDocument()
+    expect(screen.queryByText('abc…')).not.toBeInTheDocument()
+  })
 })

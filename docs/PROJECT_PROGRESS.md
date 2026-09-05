@@ -2028,6 +2028,138 @@ normalizer surfaces only the *first* pydantic error when a payload has
 multiple problems at once — acceptable for a hackathon MVP's error
 messaging, not a full multi-field error report.
 
+### Fingerprinting and Provenance Evidence
+
+**Goal**: give a judge/reviewer concrete, inspectable evidence that a
+copied payload really did originate from a specific piece of protected
+data — and be explicit about exactly what that evidence can and can't
+prove.
+
+**Before coding**: the SHA-256 fingerprinting *mechanism* already
+existed, built incrementally across two earlier features (Data
+Retrieval and Purpose Seal Propagation; Copy and Derived-Data Lineage)
+— `app/services/fingerprint.py`'s `compute_fingerprint` and
+`compute_transformed_fingerprint`, called from `retrieval_service.py`
+and `copy_service.py`, persisted on `DataAsset.fingerprint`, and
+already exposed via `DataAssetOut.fingerprint` on every asset
+endpoint. What this feature added was making it a first-class,
+independently tested, UI-visible, and explicitly-limitation-documented
+piece of provenance evidence in its own right, rather than an
+implementation detail that happened to fall out of two other features.
+
+**How it works** (unchanged from its original implementation, restated
+here as the canonical description):
+- A **root/source asset** (created via `POST /assets`) has
+  `fingerprint = None` — it isn't a copy of anything, so there's
+  nothing to attest.
+- A **retrieved copy** and a **`COPY`-type derivation** both represent
+  byte-identical content, so both get `compute_fingerprint(root_asset)`
+  — a SHA-256 hash of the root asset's stable identity (`id`, `name`,
+  `asset_type`). Every exact copy traced back to the same original gets
+  the *same* fingerprint, deterministically, no matter how many times
+  it's computed or how many separate retrievals/copies produce it.
+- A **`DERIVED`-type asset** (a summary, an analysis, a report — content
+  that has actually been transformed) gets
+  `compute_transformed_fingerprint(name, asset_type, parent)` instead —
+  a different hash, over different inputs, on purpose. It never claims
+  to be the same content as its parent, because it isn't.
+
+**Be technically honest** (the requirement's own words, and the
+project's now-explicit position, stated once here instead of only in
+code comments): a cryptographic hash can prove two blobs are
+byte-identical. **It cannot** detect that a summarized, reworded,
+partially-copied, or otherwise transformed piece of data was derived
+from protected content — an adversary who edits even one character
+defeats an exact-match hash. **This is not marketed as universal
+data-loss prevention.** PurposeSeal's primary provenance mechanism is,
+and remains, the tracked parent/root/origin-grant lineage that already
+exists on every `DataAsset` row regardless of whether any content ever
+matches byte-for-byte (see "Original Asset → Purpose Grant →
+Retrieved/Derived Asset" under Database Model, and the Interactive Data
+Lineage Visualization feature). The fingerprint is **supporting
+evidence layered on top of that lineage**, useful for the specific,
+narrow claim it can actually back up — "this exact payload matches its
+claimed origin, bit for bit" — not a substitute for it, and not a
+general content-similarity or leak-detection system.
+
+**What was added**:
+1. **Dedicated test coverage** (`backend/tests/test_fingerprint.py`,
+   11 tests) proving, independently of any other feature's tests, each
+   required property: deterministic generation (same asset hashed
+   twice → identical digest; a valid 64-character hex SHA-256 output);
+   an exact copy sharing its root's fingerprint (retrieval and `COPY`
+   derivation, including *two separate* retrievals of the same root);
+   changed content yielding a changed fingerprint (`DERIVED` differs
+   from its parent; two `DERIVED` siblings with different `name`s
+   differ from each other; direct unit-level confirmation on
+   `compute_transformed_fingerprint`); persistence (survives a
+   simulated app restart via a fresh DB session, and round-trips
+   through `GET /assets/{id}`); and the missing-content edge case (a
+   root/source asset persists and returns `fingerprint: null`, never a
+   fabricated hash or an empty string).
+2. **UI display** — `LineageGraph.jsx`'s per-node detail panel (already
+   showing Asset/Parent/Root/Grant/Purpose/Expiry/Status) now also
+   shows **Fingerprint**: the first 12 hex characters plus "…", with
+   the full 64-character digest available via a `title` hover tooltip,
+   or "N/A (original source asset)" for a root asset. Per the
+   requirement's own wording ("UI may display shortened fingerprint")
+   this is presentation-only — the full, untruncated value is still
+   exactly what's stored and returned by the API; only this one display
+   spot shortens it. 3 new frontend tests in `LineageGraph.test.jsx`
+   cover the shortened display, the hover tooltip, the no-fingerprint
+   placeholder, and that two different nodes show visibly different
+   fingerprints side by side.
+3. **This documentation entry** — the honesty requirement made
+   explicit and centralized in one place, rather than left implicit in
+   `fingerprint.py`'s docstrings (which remain, and still say the same
+   thing at the code level).
+
+**Files changed**:
+- `backend/tests/test_fingerprint.py` — new file, 11 tests (no
+  production backend code changed — the mechanism was already correct;
+  see "Before coding" above).
+- `frontend/src/components/LineageGraph.jsx` — added the shortened
+  Fingerprint field to the node detail panel.
+- `frontend/src/components/LineageGraph.test.jsx` — 3 new tests.
+
+**Tests**: Backend: **158 passed** (147 prior + 11 new). Frontend:
+**24 passed** (21 prior + 3 new). No regressions.
+
+**Manual verification**: ran an isolated `uvicorn` instance (port
+8185, its own SQLite file) and confirmed live over `curl`: a fresh
+root asset returns `fingerprint: null`; retrieving it produces a
+64-character hex digest; a `COPY` derivation from that retrieval
+returns the *identical* digest; a `DERIVED` asset from the same parent
+returns a *different* digest; and re-fetching the retrieved asset via
+`GET /assets/{id}` after the fact returns the same fingerprint it was
+created with (persistence). Verification server and database file were
+cleaned up afterward.
+
+**Known limitations** (stated here as the canonical, explicit
+version of what was previously only a code comment):
+- An exact-match SHA-256 hash proves byte-identical content and
+  nothing more. It cannot detect renamed, reworded, summarized,
+  partially-copied, re-encoded, or aggregated derivatives of protected
+  data — any of those legitimately (and correctly) produce a different
+  fingerprint, which is *not* evidence of tampering, just evidence that
+  hashing isn't the right tool for detecting transformation.
+  Transformation/derivative detection would require similarity or
+  content analysis, which is explicitly out of scope for this
+  simulated MVP.
+- The hash is computed over the asset's **simulated stable identity**
+  (`id`, `name`, `asset_type` — or, for derived content, `name` +
+  `asset_type` + parent id), not over any real file bytes, since this
+  project has no actual file content to hash in the first place (a
+  hackathon-scope simulation, not a document-management system). A real
+  deployment would hash actual payload bytes.
+- This is why lineage (`parent_asset_id`/`root_asset_id`/
+  `origin_grant_id`, tracked structurally on every row from the moment
+  it's created) is the system's primary provenance mechanism, not the
+  fingerprint — lineage answers "where did this come from" for *any*
+  descendant, transformed or not, while the fingerprint only ever
+  answers the narrower question "does this exact content match its
+  claimed origin."
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -2581,6 +2713,8 @@ lands.)
   message `feat(auth): add role-aware actor authentication`.
 - **Reliability and Idempotency Hardening**: recommended commit message
   `fix(core): harden lifecycle and error handling`.
+- **Fingerprinting and Provenance Evidence**: recommended commit
+  message `feat(provenance): add data fingerprint evidence`.
 
 ## Next Step
 
@@ -2602,3 +2736,7 @@ API-visible — a login screen in the dashboard. A reliability/idempotency
 hardening pass has since closed the copy/retrieve-quarantined-data gap
 and made the error contract fully consistent (see "Reliability and
 Idempotency Hardening" above) — no product functionality changed.
+Fingerprinting has since been given dedicated test coverage, a UI
+surface, and an explicit, honest limitations writeup (see
+"Fingerprinting and Provenance Evidence" above) — the hashing mechanism
+itself was already correct and unchanged.
