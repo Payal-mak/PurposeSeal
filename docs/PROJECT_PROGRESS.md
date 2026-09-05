@@ -2268,6 +2268,66 @@ branch coverage or behavioral completeness — a handful of narrow
 error-handling paths remain unexercised (see above), and "97% of lines
 run" is not the same claim as "97% of behavior is verified correct."
 
+### README and Technical Documentation
+
+**Goal**: with the implementation stable, produce a professional,
+top-level `README.md` describing what actually exists today — problem,
+solution, core journey, architecture, setup, testing, demo, API
+surface, key engineering decisions, and honest limitations — rather
+than continuing to require a new reader to reconstruct the system from
+this progress log alone.
+
+**What was added**: `README.md` at the repo root (no README previously
+existed). It is deliberately a *different document* from this one, not
+a duplicate: this file (`docs/PROJECT_PROGRESS.md`) is the complete,
+chronological build history — every feature, every design decision,
+every correction, kept forever, append-only. `README.md` is the
+current-state snapshot a new reader (or a judge) should read first —
+what the system does and how to run it *today*, with pointers back
+into this file for the full history and rationale behind any specific
+decision.
+
+**Before writing it**: re-verified every claim it makes against the
+actual, current system rather than transcribing prior documentation
+verbatim:
+- Re-ran `uvicorn app.main:app --reload` against an isolated DB and
+  confirmed `/health` responds as documented.
+- Re-ran `npm run build` and confirmed the frontend builds cleanly.
+- Re-grepped every `@router.get`/`@router.post` decorator across
+  `app/api/*.py` directly, rather than trusting a possibly-stale table,
+  to compile the API Overview.
+- Quoted the exact currently-passing test counts (backend 165, 97%
+  line coverage; frontend 24) and the exact commands that produce them.
+- Cross-checked every limitation listed in the README's own suggested
+  bullet list (simulated integrations, lineage requires
+  instrumentation, SHA-256 exact-match-only, SQLite at prototype scale,
+  no production IAM/EMR) against what this project actually does, and
+  added the authentication/purpose-authorization boundary and the lack
+  of an un-quarantine workflow, both real and already-documented
+  elsewhere in this file.
+- Did **not** claim HIPAA or any other regulatory certification/
+  compliance anywhere — the README says so explicitly, since the
+  "clinical trial" framing is illustrative, not a compliance claim this
+  project is in a position to make.
+
+**Files changed**:
+- `README.md` — new file.
+- `docs/PROJECT_PROGRESS.md` — this entry.
+
+**Tests**: no code changed; full suites re-confirmed unchanged —
+backend 165 passed / 97% line coverage, frontend 24 passed.
+
+**Manual verification**: every command quoted in the README's Setup
+and Testing sections was actually run during this pass (backend
+startup + `/health`, `npm run build`, `pytest -q`, `npm test -- --run`)
+rather than assumed correct from memory.
+
+**Known limitations**: the README's Limitations/Future Production
+Evolution sections are a curated top-level summary for a first-time
+reader, not exhaustive — the complete, continuously-updated list
+remains this file's own Known Issues / Deferred Work section, which
+the README links to directly.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -2825,6 +2885,8 @@ lands.)
   message `feat(provenance): add data fingerprint evidence`.
 - **Full End-to-End Automated Tests**: recommended commit message
   `test(e2e): cover complete purpose enforcement journeys`.
+- **README and Technical Documentation**: recommended commit message
+  `docs: add PurposeSeal architecture and demo guide`.
 
 ## Next Step
 
@@ -2852,4 +2914,16 @@ surface, and an explicit, honest limitations writeup (see
 itself was already correct and unchanged. The three central journeys
 now also have a consolidated, API-driven end-to-end regression suite
 with measured (not assumed) coverage (see "Full End-to-End Automated
-Tests" above) — no product functionality changed here either.
+Tests" above) — no product functionality changed here either. A
+top-level `README.md` now exists (see "README and Technical
+Documentation" above), giving a new reader a current-state entry point
+into the system; this file remains the complete, append-only build
+history and rationale behind every decision referenced from it.
+Everything the original problem statement asked for — retrieve under a
+legitimate purpose, that purpose later expiring, continued use of the
+already-retrieved data, and the system correctly identifying and
+remediating that violation without merely revoking the grant — is
+implemented, tested, and documented. Any further work from here is
+additive polish (a login screen, a global audit view, a
+resolve/dismiss workflow for `Remediation`), not a gap in the core
+scope.
