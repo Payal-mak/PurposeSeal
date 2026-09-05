@@ -318,16 +318,6 @@ authorization** — see Key Engineering Decisions below. Only
 
 ## Limitations
 
-- **Simulated integrations.** There is no real EMR, IAM, or file-
-  storage system behind this — "data" is a name and a type, "content"
-  is a hash of that name/type/id, not real bytes. This is a purpose-
-  enforcement simulation, not a working data platform.
-- **Lineage assumes instrumented systems.** Provenance is only tracked
-  because every retrieval/copy in this project *must* go through
-  PurposeSeal's own API. A real deployment can only track what actually
-  flows through instrumented paths — data copied outside the system
-  entirely (a screenshot, a verbal disclosure, an export to an
-  unmonitored tool) leaves no lineage to follow.
 - **SHA-256 fingerprinting only identifies exact content.** It proves
   two blobs are byte-identical; it cannot detect a summarized,
   reworded, or otherwise transformed derivative. Lineage — not the
@@ -338,25 +328,6 @@ authorization** — see Key Engineering Decisions below. Only
 - **SQLite is a prototype-scale choice.** No concurrent-writer scaling,
   no read replicas, no schema migration tool (tables are created via
   `create_all`, which never alters existing ones).
-- **No production IAM/EMR integration.** Authentication is a minimal,
-  hand-rolled HS256 JWT + PBKDF2 implementation (chosen to avoid adding
-  a crypto dependency for a five-role hackathon MVP) — no SSO/OAuth, no
-  token refresh/revocation, no password reset. Registration isn't
-  gated by role (anyone can self-register as `ADMIN`). Authentication
-  is deliberately **separate from purpose authorization**: logging in
-  proves who you are and what kind of actions your role permits; it
-  proves nothing about whether any specific use is within its
-  authorized purpose. A correctly-authenticated, correctly-identified
-  actor can still be denied by the policy engine — that's the system
-  working as intended, not a gap.
-- **No un-quarantine/appeal workflow.** A `Remediation` record is
-  created and tracked, but nothing in this build resolves or dismisses
-  one.
-- **This project makes no compliance claims.** It does not implement,
-  claim, or hold HIPAA (or any other regulatory) certification or
-  compliance. The "clinical trial" framing is a realistic, illustrative
-  scenario for purpose-bound data governance, not a certified
-  healthcare compliance product.
 
 The full, continuously-updated list — including everything resolved
 along the way — is in the Known Issues / Deferred Work section of
