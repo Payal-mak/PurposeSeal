@@ -712,6 +712,144 @@ reflects the grant's current values.
   the two related writes, not about coordinating across separate
   databases.
 
+### Copy and Derived-Data Lineage
+
+- **What was implemented**:
+  - `POST /copies` — create a copy or derived asset from any *existing*
+    asset that was itself legitimately retrieved (has an
+    `origin_grant_id`). Given `{parent_asset_id, name, asset_type,
+    derivation_type, actor, operation}`, it re-runs exactly the same
+    checks as retrieval — actor matches the origin grant's subject,
+    the grant is currently active (`grant_service.evaluate_grant_status`),
+    and `operation` is in the grant's `allowed_operations` — before
+    creating the child. `derivation_type` (`COPY` or `DERIVED`) decides
+    the audit event type and the fingerprinting strategy, but is **not**
+    persisted as a column (see design decision below).
+  - `GET /assets/{id}` — fetch a single asset by id (with its purpose
+    seal resolved, same as retrieval's response shape). Added because,
+    once assets can chain several levels deep, there needed to be a way
+    to look one up directly instead of only ever seeing it in a parent
+    response.
+  - `GET /assets/{id}/lineage` — the "useful query": given *any* node in
+    a lineage tree (root or a deep descendant), returns the **whole
+    tree** as `{root_asset_id, nodes, edges}` — a frontend-friendly
+    nodes/edges shape that drops directly into a graph visualization
+    library (e.g. the project's planned `@xyflow/react` lineage graph)
+    with no reshaping needed. One query suffices regardless of depth,
+    because `root_asset_id` is denormalized onto every descendant (a
+    design decision from the Core Domain Model step) — `WHERE id =
+    root_id OR root_asset_id = root_id` retrieves the entire tree in a
+    single pass, no recursive walk required.
+  - Example lineage actually produced end-to-end
+    (`patient_lab_104` → `Retrieved copy of patient_lab_104` →
+    `analysis_dataset_1` → `derived_report_1`), verified via a live
+    `uvicorn` process:
+    ```
+    GET /assets/1/lineage
+    {
+      "root_asset_id": 1,
+      "nodes": [
+        {"id": 1, "name": "patient_lab_104", "parent_asset_id": null, "root_asset_id": null, "origin_grant_id": null, ...},
+        {"id": 2, "name": "Retrieved copy of patient_lab_104", "parent_asset_id": 1, "root_asset_id": 1, "origin_grant_id": 1, ...},
+        {"id": 3, "name": "analysis_dataset_1", "parent_asset_id": 2, "root_asset_id": 1, "origin_grant_id": 1, ...},
+        {"id": 4, "name": "derived_report_1", "parent_asset_id": 3, "root_asset_id": 1, "origin_grant_id": 1, ...}
+      ],
+      "edges": [{"parent_id": 1, "child_id": 2}, {"parent_id": 2, "child_id": 3}, {"parent_id": 3, "child_id": 4}]
+    }
+    ```
+    Every node's `origin_purpose`/`origin_grant_expires_at` (omitted
+    above for brevity) all resolve to the same original grant — the
+    purpose did not disappear because the data was copied twice over.
+- **Important decisions**:
+  - **Route shape departs from the suggested example.** Rather than
+    `POST /assets/{asset_id}/copies`, this uses a flat `POST /copies`
+    (`parent_asset_id` in the body) — matching this project's existing
+    pattern of modeling an *action* as its own top-level resource
+    (`POST /retrievals`, not `POST /grants/{id}/retrievals`). Creating a
+    copy is the same kind of thing as retrieving: an event that produces
+    a new sealed asset, so it gets the same shape as retrieval, not a
+    nested-under-asset shape.
+  - **`derivation_type` is not a new `DataAsset` column.** It only
+    decides which audit event to write (`COPY_CREATED` vs
+    `DERIVED_ASSET_CREATED`) and which fingerprint function runs;
+    everything else it might imply is already fully captured by the
+    existing `parent_asset_id`/`root_asset_id`/`origin_grant_id`
+    columns. Adding a column that exists purely to label an audit
+    choice would be exactly the kind of unnecessary duplication earlier
+    steps deliberately avoided (`resource_id`, purpose/expiry on
+    `DataAsset`).
+  - **Provenance is never accepted from the caller.** `CopyCreate` has
+    no `root_asset_id` or `origin_grant_id` field at all, and uses
+    `extra="forbid"` so supplying one is a hard `422`, not a silently
+    ignored field. `root_asset_id` and `origin_grant_id` on the new
+    child are *always* computed server-side from `parent`. This is what
+    directly satisfies "cross-purpose misuse cannot silently change
+    inherited provenance" — there is no code path where a caller's input
+    can override the inherited grant/root.
+  - **Copying from a never-retrieved asset is rejected**
+    (`403 no_origin_grant`). An asset with `origin_grant_id = None` is
+    an original/root that hasn't been legitimately retrieved under any
+    purpose yet; letting someone "copy" it directly would produce a
+    derivative with no purpose seal at all, which is exactly what this
+    whole feature exists to prevent.
+  - **Cycles are prevented structurally, not by a runtime check.** This
+    endpoint only ever creates a *new* child row under an *existing*
+    parent — there is no reparenting/update operation on `DataAsset` at
+    all. A cycle would require an already-existing asset to become its
+    own ancestor, which is impossible when children can only be created
+    after, and pointing at, an already-persisted parent. No additional
+    cycle-detection code was needed or added.
+  - **Fingerprint strategy differs by `derivation_type`**: a `COPY`
+    shares its root's fingerprint (same content, same hash — extending
+    retrieval's existing approach); a `DERIVED` asset gets its own hash
+    computed from its own name/type plus its parent's id
+    (`compute_transformed_fingerprint`), since transformed content is,
+    honestly, no longer the same content. This makes the project's
+    already-documented fingerprint limitation ("can't detect
+    transformation") concrete rather than papered over: a derived
+    asset's hash *should* differ from its ancestor's.
+  - **Same atomicity pattern as the Reliability Correction**: `db.add()`
+    → `db.flush()` → `write_audit_log(...)` → single `db.commit()`,
+    wrapped in `try/except: rollback(); raise`. A copy/derivation and
+    its audit event are one transaction, same as grant creation and
+    retrieval.
+- **Files added**: `backend/app/api/{copies,assets}.py`,
+  `backend/app/schemas/{copy,lineage}.py`,
+  `backend/app/services/copy_service.py`, `backend/tests/test_lineage.py`.
+- **Files modified**: `backend/app/models/enums.py` (added
+  `DerivationType`), `backend/app/services/fingerprint.py` (added
+  `compute_transformed_fingerprint`), `backend/app/services/asset_service.py`
+  (added `get_asset`, `get_lineage`), `backend/app/schemas/__init__.py`,
+  `backend/app/api/__init__.py` (registered both new routers).
+- **Endpoints added**: `POST /copies`, `GET /assets/{id}`,
+  `GET /assets/{id}/lineage`.
+- **Tests added** (`backend/tests/test_lineage.py`, 15 tests, all
+  against isolated per-test SQLite databases): direct copy creation;
+  correct parent linkage through a 3-level chain; correct root linkage
+  through the same chain; purpose provenance (`origin_grant_id`,
+  `origin_purpose`, `origin_grant_expires_at`) preserved at every level;
+  multiple independent descendants from the same parent; lineage query
+  from the root; lineage query from a deep descendant returns the
+  identical tree; invalid parent → `404`; an attempt to supply
+  `origin_grant_id` directly is rejected with `422` (`extra="forbid"`);
+  copying a never-retrieved asset → `403 no_origin_grant`; wrong actor
+  → `403 actor_mismatch`; disallowed operation → `403
+  operation_not_permitted`; `COPY_CREATED` audit event for an exact
+  copy; `DERIVED_ASSET_CREATED` audit event for a derived asset; lineage
+  survives a fresh session bound to the same database (simulating an
+  application restart), read entirely independently of the session that
+  created it.
+- **Test result**: `57 passed, 2 warnings in 8.55s` — full suite (4
+  atomicity + 8 domain model + 4 foundation + 17 grants + 15 lineage + 9
+  retrieval), zero regressions. Also manually verified end-to-end
+  against a live `uvicorn` process, producing the example lineage shown
+  above.
+- **Known limitations**: no revocation of an individual copy/derivative
+  independent of its origin grant. No quarantine action yet (that's the
+  violation-detection feature). `GET /assets/{id}/lineage` returns the
+  *entire* tree regardless of size — fine at hackathon scale, would need
+  pagination for a very large lineage tree in a non-demo setting.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -722,6 +860,9 @@ reflects the grant's current values.
 | GET | /grants/{id} | Get one grant by id (with live-evaluated `status`) |
 | GET | /grants/{id}/status | Evaluate a grant's current status with an explanation (`reason_code`, `human_readable_reason`) |
 | POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` |
+| POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant |
+| GET | /assets/{id} | Get one asset by id, with its purpose seal resolved |
+| GET | /assets/{id}/lineage | Get the full lineage tree (`{root_asset_id, nodes, edges}`) containing this asset |
 
 No endpoint yet creates an *original* `DataAsset` — one must currently be
 seeded directly via the ORM (as the tests do) before a grant can
@@ -741,14 +882,23 @@ reference it or a retrieval can happen against it.
    and a permitted operation — a new, purpose-sealed `DataAsset` is
    created (linked to the original and the grant) and `DATA_RETRIEVED` is
    audited.
-6. Advance the simulated clock past the grant's expiry
+6. `POST /copies` with the retrieved asset's id as `parent_asset_id`, the
+   same actor, and a permitted operation — a linked `analysis_dataset_1`
+   is created (`DERIVED_ASSET_CREATED` audited), still carrying the same
+   `origin_grant_id`/`origin_purpose` as the retrieved copy. Repeat
+   against `analysis_dataset_1` to produce `derived_report_1` — the
+   purpose survives two levels of derivation.
+7. `GET /assets/{root_id}/lineage` — returns the whole tree (root →
+   retrieved copy → analysis dataset → derived report) as nodes/edges,
+   ready for a graph visualization.
+8. Advance the simulated clock past the grant's expiry
    (`clock.advance(minutes=...)`, exercised in tests; not yet exposed via
    an endpoint) — `GET /grants/{id}/status` now shows `EXPIRED`, and a
-   further `POST /retrievals` against the same grant is now denied
-   (`403 grant_not_active`) with a `DATA_RETRIEVAL_DENIED` audit event
-   instead of a retrieval.
+   further `POST /retrievals` or `POST /copies` against the same grant is
+   now denied (`403 grant_not_active`) with a denial audit event instead
+   of creating anything.
 
-(Later steps — copy-of-copy lineage, violation detection,
+(Later steps — purpose-violation detection on already-retrieved copies,
 blocking/quarantine, and their corresponding frontend screens — will be
 appended here as each feature lands.)
 
@@ -821,25 +971,33 @@ appended here as each feature lands.)
   wrapped in `try/except: rollback(); raise`. Prevents the exact
   partial-state risk of a persisted grant/asset with no audit record
   proving it happened — see the Reliability Correction entry.
+- **`GET /copies`/`POST /copies` re-validate the origin grant on every
+  call rather than trusting the parent asset's existing seal** — a copy
+  is itself a use of the grant (structurally identical to retrieval:
+  actor/status/operation), so it gets the same live checks, not a
+  cheaper "the parent was already legitimate once" shortcut.
+- **Cycle prevention is structural, not a runtime check** — `DataAsset`
+  rows are never reparented or updated after creation, only ever
+  created fresh under an already-existing parent, so a cycle is
+  impossible by construction. See the lineage feature's design decision.
 
 ## Known Issues / Deferred Work
 
 - Purpose-violation detection (evaluating *continued* use of
   already-retrieved data after its grant expires) is not implemented —
-  this step only covers the initial, legitimate retrieval. Nothing
+  copy/derivation creation currently re-checks the grant is active, but
+  nothing yet detects or reacts to use of data that was retrieved
+  *before* the grant expired and is used again *after*. Nothing
   quarantines an asset yet.
-- Copy-of-a-copy lineage (retrieving from an already-retrieved asset
-  rather than the original) is untested — the schema should support it
-  (`parent_asset_id` would point at the copy, `root_asset_id` still at
-  the true root) but this hasn't been exercised.
 - No revoke-grant endpoint yet (the evaluation logic supports `REVOKED`,
   but nothing can set it).
 - No endpoint exposes simulated time advancement (`clock.advance()`) —
   only reachable from tests/scripts today.
-- No endpoint lists or fetches a retrieved `DataAsset` by id — only the
-  `POST /retrievals` response and direct DB inspection expose one today.
 - No `UsageDecision` table yet — deferred until the policy-evaluation
   feature defines its real shape (see design decision above).
+- No revocation of an individual copy/derivative independent of its
+  origin grant. `GET /assets/{id}/lineage` returns the entire tree with
+  no pagination — fine at hackathon scale.
 - Frontend has no routing and no feature screens yet (by design for this
   step) — grants UI, retrieval UI, audit trail view, and lineage graph all
   come with their respective backend features.
@@ -872,11 +1030,13 @@ appended here as each feature lands.)
   message `feat(retrieval): propagate purpose seal to retrieved data`.
 - **Reliability Correction — atomic domain writes and audit events**:
   recommended commit message `fix(audit): make domain writes and audit events atomic`.
+- **Copy and Derived-Data Lineage**: recommended commit message
+  `feat(lineage): track copied and derived data provenance`.
 
 ## Next Step
 
-Create and track a copy: exercise retrieval against an already-retrieved
-`DataAsset` (a copy of a copy) to confirm lineage holds multiple levels
-deep, and/or begin the purpose-violation feature — evaluating continued
-use of already-retrieved data after its originating grant has expired,
-per the hackathon priority list.
+Begin purpose-violation detection: evaluate continued use (retrieval,
+copy, or derivation attempts) against already-retrieved data once its
+originating grant has expired, and take a corrective action (blocking
+use, quarantining the asset via `AssetState.QUARANTINED`), per the
+hackathon priority list.

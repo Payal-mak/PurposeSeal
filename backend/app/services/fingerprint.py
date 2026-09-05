@@ -21,3 +21,18 @@ def compute_fingerprint(root_asset: DataAsset) -> str:
     """
     content = f"{root_asset.id}:{root_asset.name}:{root_asset.asset_type}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def compute_transformed_fingerprint(name: str, asset_type: str, parent: DataAsset) -> str:
+    """A SHA-256 fingerprint for a DERIVED (transformed) asset.
+
+    Deliberately different from `compute_fingerprint(root_asset)`: an
+    exact copy shares the root's content and so shares its fingerprint,
+    but a derived/transformed asset (e.g. an analysis or a report built
+    from the original) is not the same content anymore, so it gets its
+    own hash. This makes the "an exact hash can't detect transformation"
+    limitation concrete rather than papered over — a DERIVED asset's
+    fingerprint genuinely differs from its ancestor's, by design.
+    """
+    content = f"derived:{parent.id}:{name}:{asset_type}"
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
