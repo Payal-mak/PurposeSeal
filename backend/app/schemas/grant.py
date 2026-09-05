@@ -10,7 +10,7 @@ from ..models.grant import GrantStatus
 class GrantCreate(BaseModel):
     subject: str = Field(..., min_length=1, description="Who the grant is issued to")
     purpose: str = Field(..., min_length=1, description="The bounded purpose justifying access")
-    resource_id: str = Field(..., min_length=1, description="Identifier of the sensitive resource")
+    asset_id: int = Field(..., gt=0, description="ID of the existing protected DataAsset this grant authorizes")
     duration_minutes: float = Field(..., gt=0, description="How long the grant stays active, in minutes")
     allowed_operations: Optional[list[AllowedOperation]] = Field(
         default=None,
@@ -24,7 +24,7 @@ class GrantOut(BaseModel):
     id: int
     subject: str
     purpose: str
-    resource_id: str
+    asset_id: int
     allowed_operations: list[AllowedOperation]
     status: GrantStatus
     created_at: datetime

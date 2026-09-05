@@ -1,6 +1,6 @@
 import enum
 
-from sqlalchemy import JSON, Column, DateTime, Enum as SQLEnum, Integer, String
+from sqlalchemy import JSON, Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, String
 
 from ..db.base import Base
 from .enums import AllowedOperation
@@ -17,15 +17,19 @@ def _all_operations() -> list[str]:
 
 
 class Grant(Base):
-    """PurposeSeal's PurposeGrant: why an actor may use a resource, for how
-    long, and for which operations."""
+    """PurposeSeal's PurposeGrant: why an actor may use a specific,
+    already-existing protected DataAsset, for how long, and for which
+    operations. `asset_id` is the authoritative reference to that asset —
+    there is no free-text resource identifier alongside it, to avoid two
+    sources of truth for "what this grant is about."
+    """
 
     __tablename__ = "grants"
 
     id = Column(Integer, primary_key=True, index=True)
     subject = Column(String, nullable=False)
     purpose = Column(String, nullable=False)
-    resource_id = Column(String, nullable=False, index=True)
+    asset_id = Column(Integer, ForeignKey("data_assets.id"), nullable=False, index=True)
     allowed_operations = Column(JSON, nullable=False, default=_all_operations)
     status = Column(SQLEnum(GrantStatus), nullable=False, default=GrantStatus.ACTIVE)
     created_at = Column(DateTime(timezone=True), nullable=False)

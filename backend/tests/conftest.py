@@ -12,6 +12,7 @@ from app.core.clock import clock  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import enable_sqlite_foreign_keys, get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models.data_asset import AssetState, DataAsset  # noqa: E402
 
 
 @pytest.fixture()
@@ -34,6 +35,22 @@ def db_session(db_engine):
     finally:
         session.close()
         clock.reset()
+
+
+@pytest.fixture()
+def existing_asset(db_session):
+    """An original/root DataAsset that pre-exists independently of any
+    grant, for tests that need a valid asset_id to create a grant against."""
+    asset = DataAsset(
+        name="Patient Lab Result #104",
+        asset_type="lab_result",
+        state=AssetState.ACTIVE,
+        created_at=clock.now(),
+    )
+    db_session.add(asset)
+    db_session.commit()
+    db_session.refresh(asset)
+    return asset
 
 
 @pytest.fixture()

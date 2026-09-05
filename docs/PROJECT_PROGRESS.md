@@ -53,28 +53,39 @@ at the access-grant level.
 
 ## Database Model
 
-- **Grant** (`grants` table) — PurposeSeal's "PurposeGrant": why an actor
-  may use a resource, for how long, and for which operations.
-  - `id`, `subject` (actor identity — a stable string, no auth system yet),
-    `purpose` (free-text bounded purpose), `resource_id` (string identifier
-    of the resource/dataset category this grant authorizes — **not** a
-    foreign key; see "Grant ↔ DataAsset relationship" below),
-    `allowed_operations` (JSON array of `AllowedOperation` values —
-    `VIEW`/`ANALYZE`/`COPY`/`EXPORT` — defaults to all four if not given),
-    `status` (`ACTIVE` / `EXPIRED` / `REVOKED`), `created_at` (issued time),
-    `expires_at` (both UTC datetimes).
+> **Superseded note**: this section originally had `Grant` referencing a
+> resource only by a free-text `resource_id`, and `DataAsset.origin_grant_id`
+> as `NOT NULL` on the (incorrect) assumption that an asset only exists
+> because a grant created it. That was corrected — see "Original Asset →
+> Purpose Grant → Retrieved/Derived Asset" below and the Domain Model
+> Correction entry under Implemented Features. What follows is the
+> corrected, current schema.
+
 - **DataAsset** (`data_assets` table) — an original or derived piece of
-  sensitive data.
+  sensitive data. **Exists independently of any grant** — see the
+  lifecycle explanation below.
   - `id`, `name`, `asset_type`, `parent_asset_id` (self-FK, nullable — the
     direct predecessor; `None` for an original/root asset),
     `root_asset_id` (self-FK, nullable — denormalized pointer straight at
     the top-level ancestor so lineage checks don't need to walk the parent
     chain; `None` means *this row is the root*, so the effective root id
     is always `root_asset_id or id`), `origin_grant_id` (FK to
-    `grants.id`, **not nullable** — denormalized onto every asset, root
-    and copies alike, so "which purpose justified this data" is a single-
-    column lookup), `state` (`ACTIVE` / `QUARANTINED`), `fingerprint`
-    (nullable string), `created_at` (UTC).
+    `grants.id`, **nullable** — `None` for an original/root asset that
+    pre-exists independently of any grant; set only on a retrieved/derived
+    asset, to the grant that authorized its creation), `state` (`ACTIVE` /
+    `QUARANTINED`), `fingerprint` (nullable string), `created_at` (UTC).
+- **Grant** (`grants` table) — PurposeSeal's "PurposeGrant": why an actor
+  may use one specific, already-existing protected `DataAsset`, for how
+  long, and for which operations.
+  - `id`, `subject` (actor identity — a stable string, no auth system yet),
+    `purpose` (free-text bounded purpose), `asset_id` (FK to
+    `data_assets.id`, **not nullable** — the authoritative reference to
+    the protected asset this grant authorizes use of; see "resource_id
+    removal" below), `allowed_operations` (JSON array of
+    `AllowedOperation` values — `VIEW`/`ANALYZE`/`COPY`/`EXPORT` —
+    defaults to all four if not given), `status` (`ACTIVE` / `EXPIRED` /
+    `REVOKED`), `created_at` (issued time), `expires_at` (both UTC
+    datetimes).
 - **AuditLog** (`audit_logs` table) — PurposeSeal's "AuditEvent": a
   persistent chronological record of domain activity.
   - `id`, `event_type` (e.g. `GRANT_CREATED`), `entity_type` (e.g.
@@ -84,9 +95,49 @@ at the access-grant level.
     since it must be able to log against any current or future entity
     without a schema change.
 
+### Original Asset → Purpose Grant → Retrieved/Derived Asset
+
+This is the corrected domain lifecycle, in order:
+
+1. **Original Asset** — a protected source `DataAsset` (e.g. "Patient Lab
+   Result #104") already exists in the system, independent of any grant.
+   `parent_asset_id`, `root_asset_id`, and `origin_grant_id` are all
+   `None`. Source data isn't *created by* a purpose — it's data that
+   already exists and that a purpose later authorizes someone to use.
+2. **Purpose Grant** — a `Grant` is issued *against* that existing asset:
+   `Grant.asset_id` points at it (e.g. `researcher_01` →
+   *Patient Lab Result #104* → `clinical_trial_screening` →
+   `VIEW`/`ANALYZE`/`COPY` → 30 minutes). The asset must already exist;
+   creating a grant for a nonexistent `asset_id` fails (see Tests below).
+3. **Retrieved/Derived Asset** — *not implemented yet* (a future feature).
+   Once retrieval exists, exercising a grant will create a new
+   `DataAsset` row with `parent_asset_id`/`root_asset_id` pointing at the
+   original and `origin_grant_id` set to the grant that authorized it.
+   This step only confirms the schema can represent that; no retrieval
+   logic exists yet.
+
+### `resource_id` removal — design decision
+
+The original `Grant.resource_id` (a free-text string) was **removed
+outright**, not kept as legacy/display metadata and not migrated into a
+new column. Once `Grant.asset_id` is the authoritative reference, keeping
+`resource_id` alongside it would mean two descriptions of "what this
+grant is about" that could drift out of sync (e.g. `resource_id` says one
+thing, the linked asset's `name`/`asset_type` says another) — exactly the
+"two conflicting sources of truth" this correction was asked to avoid.
+Anything resource_id used to convey for display is now available by
+joining to the asset it references. This is a breaking change to `POST
+/grants` (it now requires `asset_id` instead of `resource_id`); since no
+asset-creation endpoint exists yet, tests create the prerequisite
+`DataAsset` directly via the ORM rather than through the (not yet built)
+API — consistent with this step's schema-only scope.
+
 ### Relationships
 
-- `DataAsset.origin_grant_id` → `Grant.id` (many assets per grant).
+- `Grant.asset_id` → `DataAsset.id` (a grant always references exactly
+  one existing asset; **not nullable**).
+- `DataAsset.origin_grant_id` → `Grant.id` (nullable — only set on
+  retrieved/derived assets).
 - `DataAsset.parent_asset_id` → `DataAsset.id` (self-referential, one
   level of lineage per row).
 - `DataAsset.root_asset_id` → `DataAsset.id` (self-referential,
@@ -95,21 +146,6 @@ at the access-grant level.
   `PRAGMA foreign_keys=ON` on for every connection (production and test
   engines alike) so an invalid reference actually raises `IntegrityError`
   instead of silently succeeding.
-
-### Grant ↔ DataAsset relationship — design decision
-
-PurposeGrant's "protected/root asset" concept is **not** a foreign key on
-`Grant`. Reasoning: per the hackathon demo flow, a grant is created
-*before* any data has been retrieved (step 1), and a `DataAsset` row only
-comes into existence when that data is actually retrieved (step 2, a
-future feature) — at grant-creation time there is nothing yet for
-`Grant` to point to. So the relationship runs the other way: `Grant`
-keeps its free-text `resource_id` (which resource/category it
-authorizes), and each `DataAsset` created under it stores
-`origin_grant_id` pointing back to the grant. This also means **no
-change was needed to the existing `POST /grants` endpoint's contract**
-for `resource_id` — only an additive, optional `allowed_operations`
-field was introduced.
 
 ### Usage/policy decision entity — design decision
 
@@ -315,22 +351,97 @@ built speculatively now.
   self-FKs — tests query by id directly rather than via lineage
   traversal helpers, since no such helpers were needed to prove
   persistence.
+- **Note (corrected below)**: this entry made `origin_grant_id` `NOT
+  NULL` and kept `Grant.resource_id` as the authoritative link, on the
+  incorrect assumption that a `DataAsset` only exists because a grant
+  created it. See the Domain Model Correction entry immediately below —
+  `origin_grant_id` is now nullable and `Grant.asset_id` is a real FK.
+
+### Domain Model Correction — separate source assets from purpose grants
+
+- **What was wrong**: the previous entry required every `DataAsset` to
+  carry a `NOT NULL origin_grant_id`, implying original protected data
+  (e.g. a patient's lab result) only exists because a purpose grant was
+  created for it. In reality the source asset pre-exists; a grant is
+  issued *against* it later. `Grant` also had no real FK to the asset it
+  protects — only a free-text `resource_id`.
+- **What was implemented**: see "Original Asset → Purpose Grant →
+  Retrieved/Derived Asset" and "`resource_id` removal" under Database
+  Model above for the full reasoning. In summary:
+  - `DataAsset.origin_grant_id` changed from `NOT NULL` to nullable — an
+    original/root asset can now exist with `parent_asset_id`,
+    `root_asset_id`, and `origin_grant_id` all `None`.
+  - `Grant.resource_id` (free-text string) removed entirely; replaced
+    with `Grant.asset_id`, a real `NOT NULL` foreign key to
+    `data_assets.id`.
+  - `grant_service.create_grant` now looks up the referenced `DataAsset`
+    first and raises a clean `NotFoundError` (`asset_not_found`, HTTP
+    404) if it doesn't exist, rather than surfacing a raw
+    `IntegrityError` as a 500 to API callers. The DB-level FK constraint
+    still backstops direct ORM usage that bypasses the service.
+- **Files modified**: `backend/app/models/data_asset.py`
+  (`origin_grant_id` nullable), `backend/app/models/grant.py`
+  (`resource_id` → `asset_id`), `backend/app/schemas/grant.py`
+  (`GrantCreate`/`GrantOut`: `resource_id` → `asset_id`),
+  `backend/app/services/grant_service.py` (asset-existence check before
+  creating a grant), `backend/tests/conftest.py` (added an
+  `existing_asset` fixture — a pre-existing root `DataAsset` for tests
+  that need a valid `asset_id`), `backend/tests/test_grants.py` (every
+  grant-creation test now creates an asset first and passes `asset_id`;
+  added a nonexistent-asset → 404 test), `backend/tests/test_domain_model.py`
+  (rewritten to test the corrected lifecycle — see Tests below).
+- **Endpoints changed**: `POST /grants` now requires `asset_id` (an
+  existing `DataAsset` id) instead of `resource_id`. Breaking change to
+  the request contract; documented and accepted because no other
+  consumer of `resource_id` existed yet (frontend has no grants UI, no
+  external clients).
+- **Tests** (all against isolated per-test SQLite databases, never the
+  development database):
+  - `backend/tests/test_domain_model.py` (8 tests): an original asset can
+    exist without a grant; a grant can reference an existing original
+    asset; a grant referencing a nonexistent asset fails safely
+    (`IntegrityError`, rolled back cleanly) at the ORM level; a
+    retrieved/derived-style asset can carry both lineage
+    (`parent_asset_id`/`root_asset_id`) and `origin_grant_id` pointing at
+    the grant that authorized it; `allowed_operations` still survives
+    persistence; an audit event still persists; invalid
+    `parent_asset_id`/`origin_grant_id` references still fail safely.
+  - `backend/tests/test_grants.py` (13 tests, all passing an `asset_id`
+    from the new `existing_asset` fixture): every previous grant test
+    updated to the new contract, plus a new test that `POST /grants`
+    with a nonexistent `asset_id` returns a clean `404`
+    (`error_code: "asset_not_found"`), not a raw 500.
+  - `backend/tests/test_foundation.py` (4 tests) unaffected, re-run for
+    regression coverage.
+- **Test result**: `25 passed, 2 warnings in 2.26s` — full suite, zero
+  regressions. (Warnings are the same pre-existing Starlette/FastAPI
+  internal notices as every prior run, unrelated to this change.)
+- **Known limitations**: retrieval is still not implemented — nothing yet
+  creates a retrieved/derived `DataAsset` under a grant; this step only
+  proves the schema can represent that relationship. No endpoint exists
+  yet to create an original `DataAsset`, so grants can currently only be
+  created against assets seeded directly via the ORM (tests) or a future
+  admin/demo-seed endpoint — not yet via any HTTP call.
 
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | GET | /health | Liveness check — `{status, app_name}` |
-| POST | /grants | Create a purpose-bound access grant (now accepts optional `allowed_operations`) |
+| POST | /grants | Create a purpose-bound access grant for an existing `asset_id` (accepts optional `allowed_operations`) |
 | GET | /grants | List all grants |
 | GET | /grants/{id} | Get one grant by id |
+
+No endpoint yet creates a `DataAsset` — one must currently be seeded
+directly via the ORM (as the tests do) before a grant can reference it.
 
 ## Demo Journey
 
 1. Open the frontend shell — product name, layout, and a live "Backend
    connected" indicator confirm the stack is wired end-to-end.
-2. `POST /grants` with a subject, purpose, resource, and duration — grant
-   is created, `ACTIVE`, and audited.
+2. (Not yet exposed via API) An original `DataAsset` exists.
+3. `POST /grants` with a subject, purpose, `asset_id`, and duration —
+   grant is created, `ACTIVE`, and audited.
 
 (Later steps — retrieval, copy tracking, expiry, violation detection,
 blocking/quarantine, and their corresponding frontend screens — will be
@@ -356,12 +467,16 @@ appended here as each feature lands.)
   many-to-many table** — a small, fixed enum per grant doesn't justify a
   join table at this scale; the project's own guidance says to normalize
   "where sensible without overengineering."
-- **`DataAsset.origin_grant_id` denormalized onto every asset (root and
-  copies)** rather than only on the root — the whole point of the system
-  is "which purpose justified this data," so that lookup is made a single
-  column read instead of a lineage-chain walk, at the cost of one integer
-  column repeated down the chain. See "Grant ↔ DataAsset relationship"
-  under Database Model.
+- **`DataAsset.origin_grant_id` is nullable, set only on retrieved/derived
+  assets** (corrected from an earlier `NOT NULL` version) — an original
+  source asset exists independently of any grant; only a copy/derivative
+  created *under* a grant carries a reference back to it. See "Original
+  Asset → Purpose Grant → Retrieved/Derived Asset" under Database Model.
+- **`Grant.asset_id` is a real, `NOT NULL` foreign key to `DataAsset`**,
+  and the earlier free-text `Grant.resource_id` was removed rather than
+  kept alongside it — one authoritative reference to "what this grant is
+  about" instead of two that could drift apart. See "`resource_id`
+  removal" under Database Model.
 - **SQLite FK enforcement explicitly turned on** — SQLite ignores foreign
   keys by default per connection; without the `PRAGMA foreign_keys=ON`
   pragma, invalid lineage/grant references would silently persist instead
@@ -398,10 +513,16 @@ appended here as each feature lands.)
   `chore(core): scaffold PurposeSeal application`.
 - **Core Domain Model — DataAsset, enums, FK-safe persistence**:
   recommended commit message `feat(domain): add PurposeSeal core data model`.
+- **Domain Model Correction — separate source assets from purpose
+  grants**: recommended commit message
+  `fix(domain): separate source assets from purpose grants`.
 
 ## Next Step
 
 Retrieve simulated sensitive data under an active grant: create a
-`DataAsset` row (root, `origin_grant_id` pointing at the grant) and
-associate it with the purpose it was accessed under (attach/inherit the
-purpose seal), per the hackathon priority list.
+retrieved/derived `DataAsset` row (`parent_asset_id`/`root_asset_id`
+pointing at the original, `origin_grant_id` pointing at the grant that
+authorized it) and associate it with the purpose it was accessed under
+(attach/inherit the purpose seal), per the hackathon priority list. This
+will also need a way to create the *original* `DataAsset` in the first
+place (currently only seedable via the ORM, not via any endpoint).

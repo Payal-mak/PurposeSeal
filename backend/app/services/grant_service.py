@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..core.clock import clock
 from ..core.errors import NotFoundError
+from ..models.data_asset import DataAsset
 from ..models.enums import AllowedOperation
 from ..models.grant import Grant, GrantStatus
 from ..schemas.grant import GrantCreate
@@ -11,6 +12,10 @@ from .audit_service import write_audit_log
 
 
 def create_grant(db: Session, payload: GrantCreate) -> Grant:
+    asset = db.get(DataAsset, payload.asset_id)
+    if asset is None:
+        raise NotFoundError(f"DataAsset {payload.asset_id} not found", error_code="asset_not_found")
+
     now = clock.now()
     expires_at = now + timedelta(minutes=payload.duration_minutes)
     allowed_operations = payload.allowed_operations or list(AllowedOperation)
@@ -18,7 +23,7 @@ def create_grant(db: Session, payload: GrantCreate) -> Grant:
     grant = Grant(
         subject=payload.subject,
         purpose=payload.purpose,
-        resource_id=payload.resource_id,
+        asset_id=payload.asset_id,
         allowed_operations=[op.value for op in allowed_operations],
         status=GrantStatus.ACTIVE,
         created_at=now,
@@ -36,7 +41,7 @@ def create_grant(db: Session, payload: GrantCreate) -> Grant:
         details={
             "subject": grant.subject,
             "purpose": grant.purpose,
-            "resource_id": grant.resource_id,
+            "asset_id": grant.asset_id,
             "allowed_operations": grant.allowed_operations,
             "created_at": grant.created_at.isoformat(),
             "expires_at": grant.expires_at.isoformat(),
