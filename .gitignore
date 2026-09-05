@@ -6,6 +6,7 @@ __pycache__/
 
 # pytest
 .pytest_cache/
+.coverage
 
 # Node / frontend
 node_modules/

@@ -2160,6 +2160,114 @@ version of what was previously only a code comment):
   answers the narrower question "does this exact content match its
   claimed origin."
 
+### Full End-to-End Automated Tests
+
+**Goal**: a consolidated, dedicated end-to-end regression suite for the
+three central PurposeSeal journeys — not new functionality, a pure
+test-coverage pass. Existing tests already covered these behaviors
+piecemeal (`test_retrieval.py`, `test_policy.py`, `test_remediation.py`,
+`test_demo_scenarios.py`), and `test_demo_scenarios.py` in particular
+already exercises the same three journeys — but through the
+`/demo/scenarios/*` shortcut endpoints, which call
+`asset_service`/`grant_service`/etc. directly and collapse an entire
+journey into one HTTP call. This feature adds `test_e2e_journeys.py`,
+which drives every step of each journey through its own real API call
+(`POST /assets`, `POST /grants`, `POST /retrievals`, `POST /copies`,
+`POST /uses`), the way an actual client/integration would, and asserts
+three things together for every journey, every time: the API response,
+the persisted database state, and the audit trail.
+
+**Journeys covered**:
+- **Journey A — Legitimate purpose**: grant → retrieve → copy → valid
+  use → `ALLOW`. Asserts the grant stays `ACTIVE`, every asset in the
+  chain (root/retrieved/copy) stays `ACTIVE`, no `Remediation` row is
+  created, and the audit sequence is exactly `SOURCE_ASSET_CREATED →
+  GRANT_CREATED → DATA_RETRIEVED → COPY_CREATED → DATA_USE_ATTEMPTED →
+  USE_ALLOWED`.
+- **Journey B — Expired purpose**: grant (10-minute duration) →
+  retrieve → copy → advance simulated time past expiry → reuse →
+  `DENY`/`PURPOSE_EXPIRED` → violation → quarantine. Asserts the copy
+  (not the root asset) becomes `QUARANTINED`, `GET
+  /grants/{id}/status` independently confirms `EXPIRED` /
+  `EXPIRY_TIME_PASSED`, a `Remediation` row is persisted with
+  `reason_code="PURPOSE_EXPIRED"` and `status=COMPLIANCE_REVIEW_REQUIRED`
+  matching the API response's own remediation text, and the audit
+  sequence ends `DATA_USE_ATTEMPTED → PURPOSE_VIOLATION →
+  ASSET_QUARANTINED → COMPLIANCE_REVIEW_REQUIRED`.
+- **Journey C — Wrong purpose**: grant for `clinical_trial_screening` →
+  retrieve → attempted `marketing_analytics` use (no copy step, per
+  this journey's own definition) → `DENY`/`PURPOSE_MISMATCH` →
+  remediation. Asserts the retrieved asset quarantines while the
+  **grant itself stays `ACTIVE`** — a purpose mismatch is a fault of
+  the use, not the grant, an important and non-obvious persisted-state
+  fact this suite makes explicit — plus the same
+  `Remediation`/audit-trail checks as Journey B.
+
+**Isolated temporary databases**: no new fixture was needed —
+conftest.py's existing `client`/`db_session` fixtures already back
+every test with its own `tmp_path`-scoped SQLite file, created fresh
+and disposed per test. This suite relies on that existing isolation
+rather than inventing a second mechanism.
+
+**No real time**: Journey B advances time via `clock.advance()`, never
+`time.sleep()`; a dedicated test (`test_no_journey_depends_on_real_time_sleeping`)
+monkeypatches `time.sleep` to raise if anything in the exercised code
+paths ever called it, turning "must not depend on real waiting" into
+an enforced guarantee rather than a convention.
+
+**Repeatability**: each journey has a companion test
+(`..._can_be_run_repeatedly_without_interference`) that runs the same
+journey twice within one test, on fresh entities each time, asserting
+both runs reach the same decision independently with no id collisions
+or cross-run interference — and the file was run twice back-to-back
+during manual verification with identical results both times, plus as
+part of the full suite (which itself is re-run on every change).
+
+**Honest coverage measurement**: `pytest-cov` was added (dev/test only
+— `backend/requirements.txt`) specifically so a coverage claim could be
+measured rather than asserted. Full-suite line coverage: **97%** (1033
+statements, 27 missed) — see Tests below for the exact command and the
+handful of files with any gaps (mostly narrow error-handling branches:
+a token-decode edge case in `core/security.py`, a rollback branch in
+`policy_service.py`, and a couple of already-covered-by-other-tests
+defensive branches in `copy_service.py`). **This is not 100%, and is
+not claimed to be.**
+
+**Files changed**:
+- `backend/tests/test_e2e_journeys.py` — new file, 7 tests (no
+  production code changed).
+- `backend/requirements.txt` — added `pytest-cov` (dev/test only).
+
+**Tests**: Full backend suite: **165 passed** (158 prior + 7 new).
+Full frontend suite: **24 passed**, unchanged (no frontend code
+touched). Commands:
+```
+# This suite alone
+cd backend && ./.venv/Scripts/python.exe -m pytest tests/test_e2e_journeys.py -v
+
+# Full backend suite with coverage measurement
+cd backend && ./.venv/Scripts/python.exe -m pytest -q --cov=app --cov-report=term-missing
+```
+**Result** (`test_e2e_journeys.py` alone): **total 7, passed 7, failed
+0, skipped 0.** **Result** (full backend suite): **total 165, passed
+165, failed 0, skipped 0**, 97% line coverage.
+
+**Manual verification**: ran `test_e2e_journeys.py` twice back-to-back
+from a clean invocation each time — identical `7 passed` both times,
+confirming the isolated-tmp_path-per-test design makes the file safe
+to re-run indefinitely with no manual cleanup step.
+
+**Known limitations**: this suite intentionally duplicates some
+assertions already made (with less depth) by
+`test_demo_scenarios.py`/`test_policy.py`/`test_retrieval.py` — it
+wasn't written to replace them, since those files test other things
+too (the `/demo/scenarios/*` shortcut endpoints specifically, and many
+additional edge cases beyond these three journeys) and removing them
+wasn't asked for. 97% line coverage measures *lines executed*, not
+branch coverage or behavioral completeness — a handful of narrow
+error-handling paths remain unexercised (see above), and "97% of lines
+run" is not the same claim as "97% of behavior is verified correct."
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -2715,6 +2823,8 @@ lands.)
   `fix(core): harden lifecycle and error handling`.
 - **Fingerprinting and Provenance Evidence**: recommended commit
   message `feat(provenance): add data fingerprint evidence`.
+- **Full End-to-End Automated Tests**: recommended commit message
+  `test(e2e): cover complete purpose enforcement journeys`.
 
 ## Next Step
 
@@ -2739,4 +2849,7 @@ Idempotency Hardening" above) — no product functionality changed.
 Fingerprinting has since been given dedicated test coverage, a UI
 surface, and an explicit, honest limitations writeup (see
 "Fingerprinting and Provenance Evidence" above) — the hashing mechanism
-itself was already correct and unchanged.
+itself was already correct and unchanged. The three central journeys
+now also have a consolidated, API-driven end-to-end regression suite
+with measured (not assumed) coverage (see "Full End-to-End Automated
+Tests" above) — no product functionality changed here either.
