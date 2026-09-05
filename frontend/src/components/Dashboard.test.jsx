@@ -67,6 +67,7 @@ const ALLOW_RESPONSE = {
   asset_id: 3,
   grant_id: 1,
   remediation: null,
+  remediation_status: null,
   timeline: [
     {
       event_type: 'SOURCE_ASSET_CREATED',
@@ -103,6 +104,7 @@ const DENY_RESPONSE = {
   asset_id: 6,
   grant_id: 2,
   remediation: 'Issue a new purpose grant against the original asset if continued access is legitimate.',
+  remediation_status: 'COMPLIANCE_REVIEW_REQUIRED',
   timeline: [
     {
       event_type: 'SOURCE_ASSET_CREATED',
@@ -188,12 +190,13 @@ describe('Dashboard', () => {
     expect(screen.getByText(/matches its original purpose/i)).toBeInTheDocument()
     expect(screen.getByText(/use allowed/i)).toBeInTheDocument()
     expect(screen.getByText(/no action needed/i)).toBeInTheDocument()
+    expect(screen.getByText('N/A')).toBeInTheDocument() // no remediation status for an ALLOW decision
 
     // The button is re-enabled once the run finishes -- the scenario can be rerun.
     expect(screen.getByRole('button', { name: /run valid scenario/i })).not.toBeDisabled()
   })
 
-  it('displays a BLOCKED violation result with corrective action and quarantine timeline steps', async () => {
+  it('displays a BLOCKED violation result with corrective action, remediation status, and quarantine timeline steps', async () => {
     stubFetch({ scenario: () => jsonResponse(DENY_RESPONSE) })
     render(<Dashboard />)
 
@@ -201,6 +204,7 @@ describe('Dashboard', () => {
 
     expect(await screen.findByText('BLOCKED')).toBeInTheDocument()
     expect(screen.getByText(/issue a new purpose grant/i)).toBeInTheDocument()
+    expect(screen.getByText('COMPLIANCE_REVIEW_REQUIRED')).toBeInTheDocument()
     expect(screen.getByText(/purpose expired.*violation detected/i)).toBeInTheDocument()
     expect(screen.getByText(/asset quarantined/i)).toBeInTheDocument()
   })

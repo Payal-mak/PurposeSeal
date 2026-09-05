@@ -99,6 +99,22 @@ at the access-grant level.
     `entity_type` + `entity_id` string rather than a real foreign key,
     since it must be able to log against any current or future entity
     without a schema change.
+- **Remediation** (`remediations` table, added by the Stronger
+  Remediation Workflow feature) — a persisted, explicit record of a
+  purpose-lifecycle violation's required follow-up, created the moment
+  the policy engine quarantines an asset.
+  - `id`, `asset_id` (FK to `data_assets.id`, not nullable — the
+    affected copy), `grant_id` (FK to `grants.id`, nullable), `reason_code`
+    (e.g. `PURPOSE_EXPIRED`), `reason` (the human-readable explanation at
+    the moment of violation), `corrective_action` (plain-language next
+    step), `status` (`RemediationStatus` — currently only
+    `COMPLIANCE_REVIEW_REQUIRED`), `created_at`. Unlike `AuditLog`, this
+    table has a genuinely mutable field (`status`) a future review
+    workflow would update in place — see the design decision under
+    "Usage/policy decision entity" above for why this didn't get folded
+    into that already-deferred idea, and the feature entry under
+    Implemented Features for full reasoning. Rows here are never
+    deleted.
 
 ### Original Asset → Purpose Grant → Retrieved/Derived Asset
 
@@ -153,6 +169,17 @@ API — consistent with this step's schema-only scope.
   instead of silently succeeding.
 
 ### Usage/policy decision entity — design decision (resolved)
+
+**Update (Stronger Remediation Workflow feature): a *different*
+dedicated table — `Remediation`, not `UsageDecision` — was added, and
+the reasoning below for why `UsageDecision` stays deferred still
+holds.** `Remediation` isn't "all decisions, filterable/paginated" (the
+thing this section says isn't needed yet); it exists because a
+violation's remediation has a genuinely *mutable* field —
+`status` — that a future review workflow would update in place, unlike
+an `AuditLog` row or a `PolicyDecision` response, both of which are a
+permanent record of a single moment and are never rewritten. See
+"Stronger Remediation Workflow" under Implemented Features.
 
 **Update (Expiry, Policy Evaluation, and Continued-Use Violation
 feature): still no dedicated `UsageDecision` table — the policy engine
@@ -1531,6 +1558,133 @@ than a defect in `LineageGraph.jsx` itself.
   fresh `GET /grants/{id}` call every time a scenario re-triggers a
   lineage load) — negligible cost at this scale.
 
+### Stronger Remediation Workflow
+
+**Goal**: make remediation of a detected violation explicit and
+persistent, not just implicit in the asset's `state` and scattered
+across `AuditLog` details — without changing any existing ALLOW/DENY
+decision logic. Every check `evaluate_use` already performs (actor,
+purpose, operation, grant status) is untouched; this feature only adds
+what happens *after* a purpose-lifecycle violation is detected.
+
+- **New `Remediation` entity** (`app/models/remediation.py`) — see
+  Database Model above for its columns and the design decision for why
+  it's a real table and not folded into `AuditLog`. Created via a new,
+  minimal `app/services/remediation_service.py`
+  (`create_remediation`, `get_latest_remediation_for_asset`) — no new
+  API endpoint; nothing external asked for one, and everything the task
+  requires "shown" is already surfaced through `POST /uses`'s existing
+  response (see below).
+- **`policy_service._deny` now does one more thing** for the three
+  purpose-lifecycle reasons (`PURPOSE_EXPIRED`, `PURPOSE_MISMATCH`,
+  `GRANT_REVOKED`) — after the existing `PURPOSE_VIOLATION` +
+  quarantine + `ASSET_QUARANTINED` sequence, it creates a `Remediation`
+  row and writes a new `COMPLIANCE_REVIEW_REQUIRED` audit event, all in
+  the same atomic transaction (one `flush`-then-audit-then-`commit`,
+  same pattern as everywhere else). Ordinary access-control denials
+  (`ACTOR_MISMATCH`, `OPERATION_NOT_PERMITTED`, `NO_ORIGIN_GRANT`) are
+  completely unaffected — no remediation, no new event, matching the
+  existing quarantine-scope decision and the task's explicit "without
+  changing the basic policy semantics."
+- **`PolicyDecision`/`PolicyDecisionOut` gained two fields**:
+  `remediation` (the corrective-action text) and `remediation_status`
+  (currently only ever `"COMPLIANCE_REVIEW_REQUIRED"` or `null`). Both
+  are `null` for `ALLOW` and for ordinary access-control denials. This
+  directly satisfies "the system should show: violation → reason →
+  affected copy → corrective action → current remediation status" at
+  the one place a violation is actually reported: the `/uses` response
+  itself (`reason` + `asset_id` were already there).
+- **Corrective-action text moved into the policy engine, not the demo
+  scenarios** — `CORRECTIVE_ACTIONS` (a reason-code → message dict) now
+  lives in `policy_service.py`, so *every* real `/uses` call gets a
+  remediation message, not just the three canned demo scenarios. This
+  also deleted a duplication: `demo_service.py` used to hardcode its
+  own per-scenario remediation strings; it now just forwards
+  `decision.remediation`/`decision.remediation_status`, so there is one
+  source of truth for what a judge sees, matching the project's
+  repeated "one authoritative source per fact" pattern (`resource_id`
+  removal, purpose-seal propagation, etc.).
+- **Repeated identical requests behave safely, for free** — a second
+  `/uses` attempt against an already-quarantined asset was already
+  routed to a distinct `ASSET_QUARANTINED` reason code that isn't one
+  of the three lifecycle reasons (existing behavior, unchanged), so it
+  never re-creates a `Remediation` row or re-fires
+  `COMPLIANCE_REVIEW_REQUIRED`. That repeat response still needs to
+  *show* the existing remediation, though, so `evaluate_use` now looks
+  up `get_latest_remediation_for_asset` before calling `_deny` and
+  `_deny` echoes that row's `corrective_action`/`status` back — no new
+  violation, no new remediation, but the caller still sees the open
+  compliance-review state.
+- **No delete path was added anywhere** — `Remediation` rows and every
+  `AuditLog` row remain exactly as permanent as before; the task's "do
+  not automatically delete evidence required for audit" was already
+  the project's default (no delete endpoint exists for any entity) and
+  needed no new enforcement.
+- **Dashboard**: `ScenarioResult.jsx` gained a "Remediation Status"
+  field (between Asset and Corrective Action), sourced from the same
+  `response.remediation`/`response.remediation_status` fields the
+  dashboard already read — no new frontend API calls.
+
+**Worked example (from a live server)**:
+```
+POST /demo/scenarios/expired
+-> {"decision": "DENY", "reason_code": "PURPOSE_EXPIRED",
+    "remediation": "Issue a new purpose grant against the original asset
+                     if continued access is legitimate; this asset
+                     remains quarantined under its expired grant.",
+    "remediation_status": "COMPLIANCE_REVIEW_REQUIRED",
+    "timeline": [SOURCE_ASSET_CREATED, GRANT_CREATED, DATA_RETRIEVED,
+                 DERIVED_ASSET_CREATED, DATA_USE_ATTEMPTED,
+                 PURPOSE_VIOLATION, ASSET_QUARANTINED,
+                 COMPLIANCE_REVIEW_REQUIRED]}
+```
+
+- **Files added**: `backend/app/models/remediation.py`,
+  `backend/app/services/remediation_service.py`,
+  `backend/tests/test_remediation.py`.
+- **Files modified**: `backend/app/models/__init__.py`,
+  `backend/app/services/policy_service.py` (remediation creation +
+  lookup, `CORRECTIVE_ACTIONS`), `backend/app/schemas/policy.py`
+  (+`remediation`, `+remediation_status`), `backend/app/api/uses.py`,
+  `backend/app/schemas/demo.py` (+`remediation_status`),
+  `backend/app/services/demo_service.py` (now forwards the policy
+  engine's remediation fields instead of hardcoding its own),
+  `backend/app/api/demo.py`, `backend/tests/test_demo_scenarios.py`
+  (two timeline-sequence assertions extended with the new
+  `COMPLIANCE_REVIEW_REQUIRED` event), `frontend/src/components/
+  {ScenarioResult,Dashboard}.jsx`, `frontend/src/components/
+  Dashboard.test.jsx`.
+- **Tests added** (8 in `test_remediation.py`): violation creates a
+  `Remediation` row with the right fields; violating asset is
+  quarantined; a repeated identical request is safe (exactly one
+  `Remediation` row and one `COMPLIANCE_REVIEW_REQUIRED` event ever,
+  the repeat response still surfaces the existing remediation);
+  remediation survives a simulated restart (fresh session, same
+  engine); a legitimate (`ALLOW`) use creates no remediation and leaves
+  the asset `ACTIVE`; an ordinary access-control denial
+  (`ACTOR_MISMATCH`) creates no remediation either (basic policy
+  semantics unchanged); the `COMPLIANCE_REVIEW_REQUIRED` audit event
+  carries the remediation's id/reason_code/status; evidence (the
+  `Remediation` row and the original `PURPOSE_VIOLATION` event) is
+  unchanged by a subsequent blocked retry.
+- **Test result**: backend `120 passed` (112 prior + 8 new; two
+  existing demo-scenario tests were updated, not weakened, to expect
+  the new audit event), zero regressions. Frontend `21 passed`. Also
+  manually verified live via `uvicorn`: `POST /demo/scenarios/expired`
+  returns populated `remediation`/`remediation_status` fields and the
+  extended timeline shown above.
+- **Known limitations**: `RemediationStatus` has exactly one value
+  today (`COMPLIANCE_REVIEW_REQUIRED`) — no resolve/dismiss workflow
+  exists, so a remediation, once created, stays in that state forever.
+  This matches the task's scope (make remediation *visible and
+  persistent*, not build a full review lifecycle) and the project's
+  existing "no un-quarantine" limitation; adding a resolution status
+  and endpoint is natural future work if a reviewer-facing flow is ever
+  requested. No `GET` endpoint lists remediations directly — they're
+  only reachable via the `/uses` response that created them or by
+  querying `AuditLog`/the `Remediation` table directly (fine for this
+  project's current query needs).
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -1547,7 +1701,7 @@ than a defect in `LineageGraph.jsx` itself.
 | POST | /grants/{id}/revoke | Explicitly revoke a grant (persists `status: REVOKED` + `GRANT_REVOKED` audit event); idempotent — repeat calls return the already-revoked grant without a duplicate event |
 | POST | /retrievals | Retrieve data under a grant; creates a purpose-sealed `DataAsset` copy or denies with a clear `error_code` |
 | POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant |
-| POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at}` |
+| POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at, remediation, remediation_status}` — the last two are populated only for a purpose-lifecycle violation |
 | GET | /dev/clock | **Simulation only** — current simulated time |
 | POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
 | POST | /demo/scenarios/legitimate | **Simulation only** — runs the full legitimate-use journey in one call; returns the decision (`ALLOW`) and its complete audit timeline |
@@ -1591,16 +1745,18 @@ one browser tab, three button clicks.
    small graph: the original asset → its retrieved copy, both labeled
    `ACTIVE`.
 5. **Click "Run Expired-Purpose Scenario."** Result flips to
-   **BLOCKED**, reason names the expired grant, and Corrective Action
-   suggests issuing a new grant. The timeline ends in "Purpose Expired
-   — Violation Detected" → "Asset Quarantined." Quarantined Assets in
-   the Summary row goes from `0` to `1`; Violations Detected goes from
-   `0` to `1`. Data Lineage now shows the full chain from this
-   scenario — root asset `ACTIVE`, its retrieved copy `PURPOSE
-   EXPIRED` (the shared grant expired), the derived copy
-   `QUARANTINED`. **Click the quarantined node** — the side panel shows
-   its asset id, parent, root, associated grant, original purpose,
-   expiry, and status in one place.
+   **BLOCKED**, reason names the expired grant, Remediation Status
+   shows `COMPLIANCE_REVIEW_REQUIRED`, and Corrective Action suggests
+   issuing a new grant. The timeline ends in "Purpose Expired —
+   Violation Detected" → "Asset Quarantined" → a final
+   `COMPLIANCE_REVIEW_REQUIRED` step. Quarantined Assets in the Summary
+   row goes from `0` to `1`; Violations Detected goes from `0` to `1`.
+   Data Lineage now shows the full chain from this scenario — root
+   asset `ACTIVE`, its retrieved copy `PURPOSE EXPIRED` (the shared
+   grant expired), the derived copy `QUARANTINED`. **Click the
+   quarantined node** — the side panel shows its asset id, parent,
+   root, associated grant, original purpose, expiry, and status in one
+   place.
 6. **Click "Run Purpose-Mismatch Scenario."** Result again shows
    **BLOCKED**, this time naming `clinical_trial_screening` as the
    original purpose and `marketing_analytics` as the requested one.
@@ -1880,13 +2036,50 @@ lands.)
   new screen/route** — consistent with the "one main dashboard"
   decision from the previous feature; it loads automatically after
   each scenario run rather than requiring a separate navigation step.
+- **`Remediation` is a real table, `UsageDecision` still isn't** — see
+  the updated "Usage/policy decision entity" design decision under
+  Database Model: the two ideas look similar but solve different
+  problems. A `UsageDecision` table would be "every decision ever,
+  queryable" (still not needed); `Remediation` exists because it has a
+  field — `status` — that a future workflow would genuinely mutate,
+  unlike a decision or an audit event, both permanent records of one
+  moment.
+- **Corrective-action text lives in `policy_service.py`
+  (`CORRECTIVE_ACTIONS`), not in `demo_service.py`** — every real
+  `/uses` call now gets a remediation message, not just the three demo
+  scenarios, and there is exactly one place that text can be edited.
+  The demo scenarios' previous hardcoded, per-scenario remediation
+  strings were deleted in favor of forwarding the policy engine's own
+  `decision.remediation`.
+- **A repeated request against an already-quarantined asset creates no
+  second `Remediation` row or `COMPLIANCE_REVIEW_REQUIRED` event** —
+  this falls out of the existing `ASSET_QUARANTINED` reason code
+  already being outside `PURPOSE_LIFECYCLE_REASONS` (no new logic
+  needed for safety), but the repeat response still looks up and
+  echoes the existing remediation's `corrective_action`/`status` so the
+  caller doesn't lose visibility into the open compliance review on a
+  retry.
+- **No resolve/dismiss endpoint for a `Remediation`** — `status` has
+  exactly one value today (`COMPLIANCE_REVIEW_REQUIRED`). The task
+  asked to make remediation visible and persistent, not to build a
+  full review lifecycle; a `RESOLVED`/`DISMISSED` status and an
+  endpoint to set it are natural, separately-scoped future work.
 
 ## Known Issues / Deferred Work
 
-- No way to un-quarantine an asset (no restore/appeal flow) — this
-  project's scope is detection and corrective action, not remediation.
+- No way to un-quarantine an asset (no restore/appeal flow). ~~This
+  project's scope is detection and corrective action, not
+  remediation.~~ **Narrowed** by the Stronger Remediation Workflow
+  feature: violations now get an explicit, persistent `Remediation`
+  record with a `status` — what's still missing is only a
+  resolve/dismiss workflow that would *change* that status; a
+  `Remediation` row itself is exactly the persistent remediation state
+  this line used to say didn't exist.
 - No `UsageDecision` table — resolved as unnecessary; see the design
-  decision under Database Model (Usage/policy decision entity).
+  decision under Database Model (Usage/policy decision entity). A
+  *different* table, `Remediation`, was added instead — see the same
+  design decision's update and the Stronger Remediation Workflow
+  feature entry.
 - No way to edit/rename an original asset or delete one outright — only
   creation and listing exist; not required by any scenario so far.
 - No revocation of an individual copy/derivative independent of its
@@ -1962,15 +2155,19 @@ lands.)
   `feat(ui): add judge-ready PurposeSeal dashboard`.
 - **Interactive Data Lineage Visualization**: recommended commit
   message `feat(lineage-ui): visualize purpose-bound data provenance`.
+- **Stronger Remediation Workflow**: recommended commit message
+  `feat(remediation): persist violation response workflow`.
 
 ## Next Step
 
 The full PurposeSeal loop (create grant → retrieve → copy/derive →
-evaluate use → detect violation → quarantine) is complete, reachable
-entirely over HTTP, demoable in three single-call scenarios, and has a
-judge-ready dashboard with a live Summary/Result/Timeline/Lineage-graph
-view — see "Judge demo via the dashboard" above for exact demo steps.
-Remaining work, in rough priority order: a real browser/click-through
-verification pass once a browser-automation tool is available (see
-Known Issues), and a dedicated global audit-trail view (beyond the
-per-scenario timeline).
+evaluate use → detect violation → quarantine → persist remediation) is
+complete, reachable entirely over HTTP, demoable in three single-call
+scenarios, and has a judge-ready dashboard with a live
+Summary/Result/Timeline/Lineage-graph view, including remediation
+status — see "Judge demo via the dashboard" above for exact demo
+steps. Remaining work, in rough priority order: a real
+browser/click-through verification pass once a browser-automation tool
+is available (see Known Issues), a dedicated global audit-trail view
+(beyond the per-scenario timeline), and — if ever requested — a
+resolve/dismiss workflow for an open `Remediation`.

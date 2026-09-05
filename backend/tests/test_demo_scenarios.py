@@ -62,6 +62,7 @@ def test_expired_scenario_expected_audit_sequence_and_state(client, db_session):
         "DATA_USE_ATTEMPTED",
         "PURPOSE_VIOLATION",
         "ASSET_QUARANTINED",
+        "COMPLIANCE_REVIEW_REQUIRED",
     ]
 
     quarantined = db_session.get(DataAsset, body["asset_id"])
@@ -79,6 +80,7 @@ def test_mismatch_scenario_expected_audit_sequence_and_state(client, db_session)
         "DATA_USE_ATTEMPTED",
         "PURPOSE_VIOLATION",
         "ASSET_QUARANTINED",
+        "COMPLIANCE_REVIEW_REQUIRED",
     ]
 
     quarantined = db_session.get(DataAsset, body["asset_id"])

@@ -23,4 +23,5 @@ class DemoScenarioOut(BaseModel):
     asset_id: int
     grant_id: Optional[int]
     remediation: Optional[str] = None
+    remediation_status: Optional[str] = None
     timeline: list[TimelineEventOut]

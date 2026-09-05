@@ -19,4 +19,6 @@ def create_use(payload: UseCreate, db: Session = Depends(get_db)):
         asset_id=decision.asset_id,
         grant_id=decision.grant_id,
         evaluated_at=decision.evaluated_at,
+        remediation=decision.remediation,
+        remediation_status=decision.remediation_status,
     )

@@ -42,6 +42,7 @@ export default function ScenarioResult({ result, error }) {
         <Field label="Requested Purpose" value={result.requestedPurpose} />
         <Field label="Expiry" value={result.expiry} />
         <Field label="Asset" value={result.assetLabel} />
+        <Field label="Remediation Status" value={result.remediationStatus ?? 'N/A'} />
         <Field label="Corrective Action" value={result.correctiveAction} full />
       </dl>
     </div>

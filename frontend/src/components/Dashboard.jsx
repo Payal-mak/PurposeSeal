@@ -104,6 +104,7 @@ export default function Dashboard() {
         expiry,
         assetLabel,
         correctiveAction: response.remediation ?? DEFAULT_CORRECTIVE_ACTION,
+        remediationStatus: response.remediation_status ?? null,
         timeline,
       })
 

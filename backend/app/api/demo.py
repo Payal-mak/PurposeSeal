@@ -36,6 +36,7 @@ def _to_out(result: DemoScenarioResult) -> DemoScenarioOut:
         asset_id=result.asset_id,
         grant_id=result.grant_id,
         remediation=result.remediation,
+        remediation_status=result.remediation_status,
         timeline=[
             TimelineEventOut(
                 event_type=event.event_type,

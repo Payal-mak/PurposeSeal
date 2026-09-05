@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from ..core.clock import clock
 from ..models.data_asset import AssetState, DataAsset
 from ..models.grant import Grant, GrantStatus
+from ..models.remediation import Remediation
 from ..schemas.use import UseCreate
-from . import asset_service, grant_service
+from . import asset_service, grant_service, remediation_service
 from .audit_service import write_audit_log
 
 # Reasons that mean "the purpose itself no longer covers this data" —
@@ -21,6 +22,29 @@ from .audit_service import write_audit_log
 # docs/PROJECT_PROGRESS.md.
 PURPOSE_LIFECYCLE_REASONS = {"PURPOSE_EXPIRED", "PURPOSE_MISMATCH", "GRANT_REVOKED"}
 
+# Plain-language next step for each purpose-lifecycle violation, shown
+# to the caller and persisted on the Remediation row. Generic (not
+# per-copy wording) so the same message applies to any real /uses call,
+# not just the canned demo scenarios that used to hardcode their own
+# versions of this text.
+CORRECTIVE_ACTIONS = {
+    "PURPOSE_EXPIRED": (
+        "Issue a new purpose grant against the original asset if continued "
+        "access is legitimate; this asset remains quarantined under its "
+        "expired grant."
+    ),
+    "PURPOSE_MISMATCH": (
+        "If this new purpose is a legitimate use case, issue a new purpose "
+        "grant for it against the original asset; this asset remains "
+        "quarantined under its original grant's purpose."
+    ),
+    "GRANT_REVOKED": (
+        "Issue a new purpose grant against the original asset if continued "
+        "access is legitimate; this asset remains quarantined because its "
+        "originating grant was revoked."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class PolicyDecision:
@@ -30,6 +54,12 @@ class PolicyDecision:
     asset_id: int
     grant_id: Optional[int]
     evaluated_at: datetime
+    # Populated only for a purpose-lifecycle violation (this call or a
+    # prior one against the same, still-quarantined asset) — None for
+    # ALLOW and for ordinary access-control denials, which have nothing
+    # to remediate.
+    remediation: Optional[str] = None
+    remediation_status: Optional[str] = None
 
 
 def evaluate_use(db: Session, payload: UseCreate) -> PolicyDecision:
@@ -60,6 +90,7 @@ def evaluate_use(db: Session, payload: UseCreate) -> PolicyDecision:
             reason_code="ASSET_QUARANTINED",
             reason="This asset was already quarantined due to a prior purpose violation and cannot be used.",
             grant_id=asset.origin_grant_id,
+            existing_remediation=remediation_service.get_latest_remediation_for_asset(db, asset.id),
         )
 
     if asset.origin_grant_id is None:
@@ -147,17 +178,13 @@ def _deny(
     reason_code: str,
     reason: str,
     grant_id: Optional[int],
+    existing_remediation: Optional[Remediation] = None,
 ) -> PolicyDecision:
-    decision = PolicyDecision(
-        decision="DENY",
-        reason_code=reason_code,
-        reason=reason,
-        asset_id=asset.id,
-        grant_id=grant_id,
-        evaluated_at=now,
-    )
+    remediation_text: Optional[str] = None
+    remediation_status: Optional[str] = None
 
     if reason_code in PURPOSE_LIFECYCLE_REASONS:
+        remediation_text = CORRECTIVE_ACTIONS[reason_code]
         try:
             write_audit_log(
                 db,
@@ -179,7 +206,30 @@ def _deny(
                 details={"reason_code": reason_code},
             )
 
+            remediation = remediation_service.create_remediation(
+                db,
+                asset_id=asset.id,
+                grant_id=grant_id,
+                reason_code=reason_code,
+                reason=reason,
+                corrective_action=remediation_text,
+            )
+
+            # Same entity_type/entity_id as PURPOSE_VIOLATION and
+            # ASSET_QUARANTINED (not "remediation") so this event shows
+            # up in the same per-asset audit trail/timeline queries as
+            # everything else about this violation, with the
+            # remediation row's own id kept in `details` for traceability.
+            write_audit_log(
+                db,
+                event_type="COMPLIANCE_REVIEW_REQUIRED",
+                entity_type="data_asset",
+                entity_id=asset.id,
+                details={"remediation_id": remediation.id, "reason_code": reason_code, "status": remediation.status.value},
+            )
+
             db.commit()
+            remediation_status = remediation.status.value
         except Exception:
             db.rollback()
             raise
@@ -193,4 +243,21 @@ def _deny(
         )
         db.commit()
 
-    return decision
+        # A repeat attempt against an already-quarantined asset doesn't
+        # re-violate or re-remediate (see the ASSET_QUARANTINED branch
+        # above in evaluate_use) -- it just still has an open
+        # remediation, which the caller should keep seeing.
+        if existing_remediation is not None:
+            remediation_text = existing_remediation.corrective_action
+            remediation_status = existing_remediation.status.value
+
+    return PolicyDecision(
+        decision="DENY",
+        reason_code=reason_code,
+        reason=reason,
+        asset_id=asset.id,
+        grant_id=grant_id,
+        evaluated_at=now,
+        remediation=remediation_text,
+        remediation_status=remediation_status,
+    )

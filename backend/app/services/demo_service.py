@@ -43,6 +43,7 @@ class DemoScenarioResult:
     asset_id: int
     grant_id: Optional[int]
     remediation: Optional[str]
+    remediation_status: Optional[str]
     timeline: list[AuditLog]
 
 
@@ -102,7 +103,8 @@ def run_legitimate_scenario(db: Session) -> DemoScenarioResult:
         reason=decision.reason,
         asset_id=decision.asset_id,
         grant_id=decision.grant_id,
-        remediation=None,
+        remediation=decision.remediation,
+        remediation_status=decision.remediation_status,
         timeline=timeline,
     )
 
@@ -157,11 +159,8 @@ def run_expired_scenario(db: Session) -> DemoScenarioResult:
         reason=decision.reason,
         asset_id=decision.asset_id,
         grant_id=decision.grant_id,
-        remediation=(
-            "Issue a new purpose grant against the original asset if continued "
-            "access is legitimate; this derived copy remains quarantined and "
-            "cannot be reused under its expired grant."
-        ),
+        remediation=decision.remediation,
+        remediation_status=decision.remediation_status,
         timeline=timeline,
     )
 
@@ -200,11 +199,7 @@ def run_purpose_mismatch_scenario(db: Session) -> DemoScenarioResult:
         reason=decision.reason,
         asset_id=decision.asset_id,
         grant_id=decision.grant_id,
-        remediation=(
-            f"If '{MARKETING_PURPOSE}' is a legitimate use case, issue a new "
-            "purpose grant for it against the original asset; this retrieved "
-            "copy remains quarantined and cannot be reused under its original "
-            f"'{CLINICAL_TRIAL_PURPOSE}' grant."
-        ),
+        remediation=decision.remediation,
+        remediation_status=decision.remediation_status,
         timeline=timeline,
     )
