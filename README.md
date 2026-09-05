@@ -278,6 +278,58 @@ authorization** — see Key Engineering Decisions below. Only
 `actor` field on `/retrievals`/`/copies`/`/uses` are auth-aware; every
 `GET` and the dev/demo endpoints are unauthenticated by design.
 
+## Beyond the PRD
+
+The original problem statement asked for one specific thing: a system
+that manages simulated purpose-bound grants, tracks what happens to
+data retrieved under them, and — in a convincing demonstration —
+correctly identifies and addresses continued use of that data after
+its authorizing purpose no longer applies. Everything below goes
+beyond that literal ask; none of it was required by the PRD.
+
+- **A full web dashboard.** The PRD only required "a convincing
+  demonstration" — it didn't call for a UI at all. Instead of a script
+  or raw API calls, PurposeSeal has a real React/Tailwind dashboard
+  with live metrics, one-click scenarios, a decision panel, and a
+  rendered audit timeline.
+- **An interactive lineage graph.** Provenance is exposed as a
+  clickable visual tree (`@xyflow/react`), not just rows in a table —
+  click any node to see its parent, root, grant, purpose, expiry,
+  status, and fingerprint in one panel.
+- **Role-aware authentication**, kept strictly separate from purpose
+  authorization. The PRD's scope was the purpose-enforcement engine
+  itself; login/roles (Researcher, Clinician, Analyst, Compliance
+  Officer, Admin) are an added layer, deliberately designed so that
+  being authenticated never implies a use is purpose-valid.
+- **SHA-256 content fingerprinting** as supporting provenance evidence
+  for exact copies — layered on top of the lineage tracking the PRD
+  actually asked for, with its limitations (can't detect transformed
+  content) stated explicitly rather than oversold.
+- **A persistent remediation workflow.** The PRD asked the system to
+  "identify and address" violations; this build goes further by
+  persisting a structured `Remediation` record (reason, corrective
+  action, review status) for every violation, not just logging a
+  denial and moving on.
+- **Explicit, RBAC-gated, idempotent grant revocation** — a dedicated
+  `POST /grants/{id}/revoke` endpoint (repeat calls are safe, no
+  duplicate audit events), rather than relying only on natural
+  time-based expiry to end a grant's validity.
+- **Deterministic one-call demo scenarios** (`/demo/scenarios/*`) built
+  specifically so a live judged demo can be re-run indefinitely with
+  no timing dependencies or manual setup — a reliability concern the
+  PRD didn't ask about but that matters a great deal in a judging room.
+- **A dedicated reliability/idempotency hardening pass** — a review
+  pass, after the core was stable, specifically hunting for the class
+  of bugs that embarrass a live demo (double-clicks, duplicate
+  requests, a quarantined asset that could still be copied through an
+  unguarded path) and fixing what was found with regression tests.
+- **A full end-to-end regression suite with honestly measured
+  coverage** — 165 backend tests, 24 frontend tests, 97% line coverage
+  measured with `pytest-cov`, not claimed from memory.
+- **A consistent, frontend-friendly error contract** across the entire
+  API (`{error_code, message}` everywhere, including validation
+  errors), rather than leaking framework-default error shapes.
+
 ## Key Engineering Decisions
 
 - **Deterministic policy engine, not a model.** `evaluate_use()` is
