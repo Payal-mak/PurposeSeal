@@ -3,8 +3,8 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from . import models
-from .clock import clock
+from ..core.clock import clock
+from ..models.audit_log import AuditLog
 
 
 def write_audit_log(
@@ -14,8 +14,8 @@ def write_audit_log(
     entity_type: str,
     entity_id: Any,
     details: Optional[dict] = None,
-) -> models.AuditLog:
-    entry = models.AuditLog(
+) -> AuditLog:
+    entry = AuditLog(
         event_type=event_type,
         entity_type=entity_type,
         entity_id=str(entity_id),

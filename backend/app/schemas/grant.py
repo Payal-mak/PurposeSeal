@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import GrantStatus
+from ..models.grant import GrantStatus
 
 
 class GrantCreate(BaseModel):

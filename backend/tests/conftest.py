@@ -8,8 +8,9 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.clock import clock  # noqa: E402
-from app.database import Base, get_db  # noqa: E402
+from app.core.clock import clock  # noqa: E402
+from app.db.base import Base  # noqa: E402
+from app.db.session import get_db  # noqa: E402
 from app.main import app  # noqa: E402
 
 

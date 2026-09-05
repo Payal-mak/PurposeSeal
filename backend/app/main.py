@@ -1,23 +1,24 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .database import Base, engine
-from .routers import grants
+from .api import api_router
+from .core.config import get_settings
+from .core.errors import register_exception_handlers
+from .db.session import init_db
 
-Base.metadata.create_all(bind=engine)
+settings = get_settings()
 
-app = FastAPI(title="PurposeSeal")
+init_db()
+
+app = FastAPI(title=settings.app_name)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(grants.router)
+register_exception_handlers(app)
 
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+app.include_router(api_router)

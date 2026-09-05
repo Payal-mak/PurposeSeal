@@ -1,8 +1,8 @@
 import enum
 
-from sqlalchemy import Column, DateTime, Enum as SQLEnum, Integer, String, Text
+from sqlalchemy import Column, DateTime, Enum as SQLEnum, Integer, String
 
-from .database import Base
+from ..db.base import Base
 
 
 class GrantStatus(str, enum.Enum):
@@ -21,14 +21,3 @@ class Grant(Base):
     status = Column(SQLEnum(GrantStatus), nullable=False, default=GrantStatus.ACTIVE)
     created_at = Column(DateTime(timezone=True), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
-
-
-class AuditLog(Base):
-    __tablename__ = "audit_logs"
-
-    id = Column(Integer, primary_key=True, index=True)
-    event_type = Column(String, nullable=False, index=True)
-    entity_type = Column(String, nullable=False)
-    entity_id = Column(String, nullable=False, index=True)
-    details = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False)

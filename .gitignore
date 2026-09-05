@@ -7,9 +7,14 @@ __pycache__/
 # pytest
 .pytest_cache/
 
-# Node / frontend (added when frontend scaffold lands)
+# Node / frontend
 node_modules/
 dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
 
 # Editor
 .vscode/
