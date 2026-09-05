@@ -147,7 +147,25 @@ API — consistent with this step's schema-only scope.
   engines alike) so an invalid reference actually raises `IntegrityError`
   instead of silently succeeding.
 
-### Usage/policy decision entity — design decision
+### Usage/policy decision entity — design decision (resolved)
+
+**Update (Expiry, Policy Evaluation, and Continued-Use Violation
+feature): still no dedicated `UsageDecision` table — the policy engine
+has now landed, and `AuditLog` proved sufficient.** Every use evaluation
+writes `DATA_USE_ATTEMPTED`, then one of `USE_ALLOWED` /
+`USE_BLOCKED` / `PURPOSE_VIOLATION` (see `services/policy_service.py`),
+each carrying the full decision context in `details`. The live
+`PolicyDecision` returned by `POST /uses` already gives callers the
+required structured shape (`decision`, `reason_code`, `reason`,
+`asset_id`, `grant_id`, `evaluated_at`) at the moment of evaluation —
+querying *past* decisions means querying `AuditLog` by `entity_id`,
+which every test in `test_policy.py` already does successfully. A
+dedicated table would only pay for itself if a query like "all
+decisions across all assets, filterable/paginated" were actually needed;
+nothing in this project requires that yet, so it stays deferred rather
+than built speculatively.
+
+<details><summary>Original deferral reasoning (superseded, kept for history)</summary>
 
 No dedicated `UsageDecision` table was added this step. Reasoning: no
 evaluation logic exists yet (that is the "detect purpose expiry" /
@@ -162,6 +180,8 @@ When the policy engine lands, its required output shape (`decision`,
 justify a dedicated, queryable `UsageDecision` table so judges can filter
 decisions by grant/asset; that table is deferred to that feature, not
 built speculatively now.
+
+</details>
 
 ### Purpose Seal propagation — design decision
 
@@ -850,6 +870,163 @@ reflects the grant's current values.
   *entire* tree regardless of size — fine at hackathon scale, would need
   pagination for a very large lineage tree in a non-demo setting.
 
+### Expiry, Policy Evaluation, and Continued-Use Violation — MAJOR CHECKPOINT MILESTONE
+
+This is the feature the whole project exists to demonstrate: detecting
+and reacting to continued use of data that was legitimately retrieved,
+after the purpose that justified it has expired or changed — not merely
+revoking future access to the source.
+
+- **What was implemented**:
+  - `POST /uses` — evaluates an attempted use
+    (`{asset_id, actor, purpose, operation}`) of an **already-retrieved
+    or derived** asset against the purpose that originally justified it.
+    Always returns HTTP `200` with a structured decision — `DENY` is a
+    valid, successful evaluation outcome, not an API error (unlike
+    retrieval/copy, which reject with 403/404 because those are
+    mutations that either happen or don't; a use evaluation's entire job
+    *is* to produce ALLOW-or-DENY, so treating DENY as an HTTP error
+    would be modeling it wrong).
+  - `services/policy_service.py:evaluate_use` — the policy engine, a
+    pure function of: `asset.state`, `asset.origin_grant_id`, the
+    inherited `Grant` (`subject`, `purpose`, `allowed_operations`),
+    `grant_service.evaluate_grant_status` (reused, not reimplemented),
+    the request's claimed `actor`/`purpose`/`operation`, and
+    `clock.now()`. Checks run in this order, first match wins:
+    1. `asset.state == QUARANTINED` → `DENY ASSET_QUARANTINED`
+    2. `asset.origin_grant_id is None` → `DENY NO_ORIGIN_GRANT`
+    3. `grant.subject != actor` → `DENY ACTOR_MISMATCH`
+    4. `purpose != grant.purpose` → `DENY PURPOSE_MISMATCH`
+    5. `operation not in grant.allowed_operations` → `DENY OPERATION_NOT_PERMITTED`
+    6. grant evaluates to `EXPIRED` → `DENY PURPOSE_EXPIRED`
+    7. grant evaluates to `REVOKED` → `DENY GRANT_REVOKED`
+    8. otherwise → `ALLOW WITHIN_PURPOSE_AND_VALIDITY`
+  - Every call writes `DATA_USE_ATTEMPTED` unconditionally first (its own
+    immediate commit — an audit-only fact, same pattern as retrieval's
+    denied-attempt logging), then exactly one outcome event: `USE_ALLOWED`
+    on ALLOW; `PURPOSE_VIOLATION` + `ASSET_QUARANTINED` (one atomic
+    commit, quarantining the asset) for reasons 6–7 and 4; `USE_BLOCKED`
+    (no quarantine) for reasons 1–3 and 5. See the quarantine-scope
+    design decision below for exactly which reasons quarantine.
+  - **Simulation clock exposed over HTTP, clearly marked as
+    dev-only**: `GET /dev/clock` and `POST /dev/clock/advance`
+    (`{minutes, seconds, hours}`) — thin wrappers around the existing
+    `Clock` singleton, registered under the project's clock abstraction.
+    Namespaced under `/dev` (distinct from every business router) and
+    only registered at all when `settings.enable_dev_endpoints` is true
+    (new config flag, defaults to `True` for this hackathon build,
+    documented as needing to be `False` — `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false`
+    — for anything resembling a real deployment). Tests already
+    manipulated `clock.advance()` directly in Python; this closes the
+    gap so the *demo* can advance time via the same HTTP surface
+    everything else uses, without a real 30-minute wait.
+  - Verified all three scenarios from the spec end-to-end against a live
+    `uvicorn` process — see the worked example below.
+- **Important decisions**:
+  - **Quarantine scope: only purpose-lifecycle reasons quarantine.**
+    `PURPOSE_EXPIRED`, `PURPOSE_MISMATCH`, and `GRANT_REVOKED` — the
+    reasons that mean "the purpose itself no longer covers this data,"
+    which is literally this feature's subject — quarantine the asset.
+    `ACTOR_MISMATCH`, `OPERATION_NOT_PERMITTED`, and
+    `ASSET_QUARANTINED`-already do **not** additionally quarantine
+    anything; they're ordinary access-control denials (an unauthorized
+    party touching legitimately-purposed data, or a permitted actor
+    asking for something the grant never covered) — the data itself
+    isn't at fault, so it isn't punished. This mirrors the project's own
+    "avoid punishing the source record merely because one derived copy
+    was misused" instruction, applied one level down: avoid punishing a
+    *legitimately purposed* asset merely because a request against it
+    was invalid for reasons unrelated to purpose lifecycle. This was a
+    genuine judgment call (the task's "Required violation response"
+    section doesn't explicitly scope which denials quarantine) —
+    documented here precisely so it's easy to revisit.
+  - **`POST /uses` always returns 200; DENY is not an HTTP error.**
+    Contrast with retrieval/copy, which use 403/404 because those
+    represent "this write did or didn't happen." A use evaluation
+    doesn't write anything conditional on its own outcome (the asset
+    already exists) — its entire purpose is to produce a decision, so
+    the decision *is* the response body, not an exception.
+  - **`evaluate_grant_status` reused verbatim**, not reimplemented — the
+    policy engine has exactly one place that decides "is this grant
+    currently valid," used identically by `GET /grants/{id}/status`,
+    retrieval, copy creation, and now use evaluation.
+  - **No `UsageDecision` table** — see the resolved design decision
+    under Database Model above.
+  - **Dev clock is a real, if minimal, security boundary, not just a
+    naming convention** — gated behind a settings flag that a real
+    deployment must flip off, not merely parked under a `/dev` prefix
+    that anyone could still call.
+  - **Same atomicity pattern throughout**: the one place a business
+    state change happens (quarantine) shares a single commit with its
+    two audit events, wrapped in `try/except: rollback(); raise`,
+    consistent with the Reliability Correction.
+- **Worked example (from a live server)**:
+  ```
+  Setup: grant(researcher_01, clinical_trial_screening, VIEW/ANALYZE/COPY, 30 min)
+         → retrieve patient_lab_104 → retrieved copy (asset id 2)
+
+  Scenario A — valid continued use:
+    POST /uses {asset_id: 2, actor: researcher_01, purpose: clinical_trial_screening, operation: ANALYZE}
+    → 200 {"decision": "ALLOW", "reason_code": "WITHIN_PURPOSE_AND_VALIDITY", ...}
+
+  Scenario C — wrong purpose (on a sibling copy, asset id 3):
+    POST /uses {asset_id: 3, actor: researcher_01, purpose: marketing_analytics, operation: ANALYZE}
+    → 200 {"decision": "DENY", "reason_code": "PURPOSE_MISMATCH",
+            "reason": "This data was retrieved for 'clinical_trial_screening', not 'marketing_analytics'."}
+    → asset 3 state: QUARANTINED
+
+  Scenario B — expired purpose (advance clock 31 minutes past the 30-minute grant):
+    POST /dev/clock/advance {"minutes": 31}
+    POST /uses {asset_id: 2, actor: researcher_01, purpose: clinical_trial_screening, operation: ANALYZE}
+    → 200 {"decision": "DENY", "reason_code": "PURPOSE_EXPIRED",
+            "reason": "The purpose grant authorizing this data expired at ... and was evaluated at ..."}
+    → asset 2 state: QUARANTINED
+    → root asset (patient_lab_104) state: ACTIVE (untouched)
+  ```
+- **Files added**: `backend/app/api/{uses,dev}.py`,
+  `backend/app/schemas/{use,policy,dev}.py`,
+  `backend/app/services/policy_service.py`, `backend/tests/{test_policy,test_dev_clock}.py`.
+- **Files modified**: `backend/app/core/config.py` (added
+  `enable_dev_endpoints`), `backend/app/schemas/__init__.py`,
+  `backend/app/api/__init__.py` (registered `/uses` unconditionally,
+  `/dev` conditionally on the new setting).
+- **Endpoints added**: `POST /uses`, `GET /dev/clock`,
+  `POST /dev/clock/advance`.
+- **Tests added**:
+  - `backend/tests/test_policy.py` (17 tests): use while active → ALLOW;
+    use exactly one minute before expiry → ALLOW (boundary check); use
+    after expiry → DENY `PURPOSE_EXPIRED` + quarantine; purpose mismatch
+    → DENY `PURPOSE_MISMATCH` + quarantine; unsupported operation → DENY
+    `OPERATION_NOT_PERMITTED`, **not** quarantined; wrong actor → DENY
+    `ACTOR_MISMATCH`, not quarantined; expired use creates a
+    `PURPOSE_VIOLATION` audit event with the right `reason_code` in its
+    details; violating copy becomes `QUARANTINED`; root asset stays
+    `ACTIVE` when a derived copy is quarantined; a quarantined asset's
+    second use attempt is denied again without a duplicate
+    `ASSET_QUARANTINED` event; a legitimate sibling asset (same parent,
+    different branch) remains fully usable after its sibling is
+    quarantined; every response (ALLOW and DENY) includes a non-empty
+    `reason`; use of a never-retrieved asset → DENY `NO_ORIGIN_GRANT`;
+    use of a nonexistent asset → `404`; response includes `evaluated_at`.
+  - `backend/tests/test_dev_clock.py` (3 tests): `GET /dev/clock`
+    returns a valid timestamp; `POST /dev/clock/advance` actually moves
+    simulated time forward by the requested amount; omitting all fields
+    is a no-op (only real time elapses).
+- **Test result**: `75 passed, 2 warnings in 8.85s` — full suite (4
+  atomicity + 3 dev clock + 8 domain model + 4 foundation + 17 grants +
+  15 lineage + 17 policy + 9 retrieval), zero regressions. Also manually
+  verified all three required scenarios (A/B/C) end-to-end against a
+  live `uvicorn` process — see the worked example above.
+- **Known limitations**: no way to un-quarantine an asset (no
+  "restore"/appeal flow — matches the project's scope, which asks for
+  detection and corrective action, not remediation). No revoke-grant
+  endpoint yet, so `GRANT_REVOKED` is reachable in code but not yet
+  triggerable through any API call. `POST /uses` doesn't itself create
+  any new `DataAsset` — it only evaluates and, on a purpose-lifecycle
+  violation, mutates the existing asset's state; this is intentional
+  (the scenario is "use of already-retrieved data," not another
+  retrieval).
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -863,6 +1040,9 @@ reflects the grant's current values.
 | POST | /copies | Create a copy or derived asset from an existing, already-retrieved asset; re-checks actor/status/operation against its origin grant |
 | GET | /assets/{id} | Get one asset by id, with its purpose seal resolved |
 | GET | /assets/{id}/lineage | Get the full lineage tree (`{root_asset_id, nodes, edges}`) containing this asset |
+| POST | /uses | Evaluate an attempted use of an already-retrieved/derived asset against its origin purpose; always `200`, body carries `{decision, reason_code, reason, asset_id, grant_id, evaluated_at}` |
+| GET | /dev/clock | **Simulation only** — current simulated time |
+| POST | /dev/clock/advance | **Simulation only** — advance simulated time by `{minutes, seconds, hours}`; disable via `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` |
 
 No endpoint yet creates an *original* `DataAsset` — one must currently be
 seeded directly via the ORM (as the tests do) before a grant can
@@ -891,16 +1071,26 @@ reference it or a retrieval can happen against it.
 7. `GET /assets/{root_id}/lineage` — returns the whole tree (root →
    retrieved copy → analysis dataset → derived report) as nodes/edges,
    ready for a graph visualization.
-8. Advance the simulated clock past the grant's expiry
-   (`clock.advance(minutes=...)`, exercised in tests; not yet exposed via
-   an endpoint) — `GET /grants/{id}/status` now shows `EXPIRED`, and a
-   further `POST /retrievals` or `POST /copies` against the same grant is
-   now denied (`403 grant_not_active`) with a denial audit event instead
-   of creating anything.
+8. `POST /uses {asset_id: <retrieved copy>, actor, purpose:
+   clinical_trial_screening, operation: ANALYZE}` while the grant is
+   still active — `200 {"decision": "ALLOW", ...}`.
+9. `POST /uses` with `purpose: marketing_analytics` on a sibling copy —
+   `200 {"decision": "DENY", "reason_code": "PURPOSE_MISMATCH", ...}`,
+   and that sibling's `state` becomes `QUARANTINED`.
+10. `POST /dev/clock/advance {"minutes": 31}` — simulated time jumps past
+    the grant's 30-minute expiry in an instant, no real waiting.
+    `GET /grants/{id}/status` now shows `EXPIRED`.
+11. `POST /uses` again on the original retrieved copy — `200 {"decision":
+    "DENY", "reason_code": "PURPOSE_EXPIRED", ...}`, that copy becomes
+    `QUARANTINED`, and `GET /assets/{root_id}` confirms the **original
+    source asset stays `ACTIVE`** — only the misused copy was punished.
+12. A further `POST /uses` on the now-quarantined copy is denied again
+    (`ASSET_QUARANTINED`) without re-triggering quarantine, while a
+    completely different sibling asset remains normally usable.
 
-(Later steps — purpose-violation detection on already-retrieved copies,
-blocking/quarantine, and their corresponding frontend screens — will be
-appended here as each feature lands.)
+(Later steps — frontend screens for everything above, e.g. an actual
+lineage graph visualization — will be appended here as each feature
+lands.)
 
 ## Technical Decisions
 
@@ -980,21 +1170,30 @@ appended here as each feature lands.)
   rows are never reparented or updated after creation, only ever
   created fresh under an already-existing parent, so a cycle is
   impossible by construction. See the lineage feature's design decision.
+- **Only purpose-lifecycle DENY reasons quarantine an asset**
+  (`PURPOSE_EXPIRED`, `PURPOSE_MISMATCH`, `GRANT_REVOKED`); ordinary
+  access-control denials (`ACTOR_MISMATCH`, `OPERATION_NOT_PERMITTED`)
+  do not — the asset isn't at fault for a request that was never
+  legitimate for reasons unrelated to its purpose. See the policy
+  feature's design decision.
+- **`POST /uses` always returns `200`; `DENY` is data, not an HTTP
+  error** — unlike retrieval/copy (mutations that succeed or get
+  rejected), a use evaluation's entire job is to produce a decision, so
+  the decision is the response body in both directions.
+- **Dev-only endpoints live under `/dev` and behind a settings flag**
+  (`enable_dev_endpoints`, default `True`) — a real deployment sets
+  `PURPOSESEAL_ENABLE_DEV_ENDPOINTS=false` to remove `clock.advance()`
+  from the API surface entirely, not just rely on the path naming.
 
 ## Known Issues / Deferred Work
 
-- Purpose-violation detection (evaluating *continued* use of
-  already-retrieved data after its grant expires) is not implemented —
-  copy/derivation creation currently re-checks the grant is active, but
-  nothing yet detects or reacts to use of data that was retrieved
-  *before* the grant expired and is used again *after*. Nothing
-  quarantines an asset yet.
-- No revoke-grant endpoint yet (the evaluation logic supports `REVOKED`,
-  but nothing can set it).
-- No endpoint exposes simulated time advancement (`clock.advance()`) —
-  only reachable from tests/scripts today.
-- No `UsageDecision` table yet — deferred until the policy-evaluation
-  feature defines its real shape (see design decision above).
+- No way to un-quarantine an asset (no restore/appeal flow) — this
+  project's scope is detection and corrective action, not remediation.
+- No revoke-grant endpoint yet, so `GRANT_REVOKED` is reachable in
+  `evaluate_grant_status`/the policy engine but not yet triggerable
+  through any API call.
+- No `UsageDecision` table — resolved as unnecessary; see the design
+  decision under Database Model (Usage/policy decision entity).
 - No revocation of an individual copy/derivative independent of its
   origin grant. `GET /assets/{id}/lineage` returns the entire tree with
   no pagination — fine at hackathon scale.
@@ -1032,11 +1231,15 @@ appended here as each feature lands.)
   recommended commit message `fix(audit): make domain writes and audit events atomic`.
 - **Copy and Derived-Data Lineage**: recommended commit message
   `feat(lineage): track copied and derived data provenance`.
+- **Expiry, Policy Evaluation, and Continued-Use Violation** (major
+  checkpoint milestone): recommended commit message
+  `feat(policy): enforce purpose lifecycle on retrieved data`.
 
 ## Next Step
 
-Begin purpose-violation detection: evaluate continued use (retrieval,
-copy, or derivation attempts) against already-retrieved data once its
-originating grant has expired, and take a corrective action (blocking
-use, quarantining the asset via `AssetState.QUARANTINED`), per the
-hackathon priority list.
+With the core loop complete (create grant → retrieve → copy/derive →
+evaluate use → detect violation → quarantine), remaining work is mostly
+rounding out the demo: a minimal endpoint to create an *original*
+`DataAsset` (still only seedable via the ORM today), a revoke-grant
+endpoint, and — per the hackathon priority list — the minimal usable
+frontend walking a judge through the whole journey end-to-end.
