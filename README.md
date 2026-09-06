@@ -111,7 +111,7 @@ Continued-use attempt → Policy decision → Remediation → Audit
 - **SQLite** — via SQLAlchemy, one file (`backend/purposeseal.db` by
   default, overridable via `PURPOSESEAL_DATABASE_URL`), foreign keys
   explicitly enforced (`PRAGMA foreign_keys=ON`, off by default in
-  SQLite). Chosen for hackathon-scale simplicity — see Limitations.
+  SQLite). Chosen for hackathon-scale simplicity.
 - **Policy Engine** — `services/policy_service.py`, plain deterministic
   Python/SQL. `evaluate_use()` re-checks actor, purpose, operation, and
   live grant status on *every* use attempt against the asset's
